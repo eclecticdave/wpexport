@@ -104,9 +104,10 @@ for my $page (@pages) {
 	print "\tExporting From Wikipedia\n";
 	my $wpxml = export_page('WP', $page);
 
+	my $esxml;
 	if ($opts{merge}) {
 		print "\tExporting From Encoresoup\n";
-		my $esxml = export_page('ES', $page);
+		$esxml = export_page('ES', $page);
 	}
 
 	$filter = ($isimage) ? 3 : 1;
@@ -250,7 +251,7 @@ sub get_contributors
 	$normpage =~ s/:/_/g;
 
 	my $linkpage = $page;
-	$page = ':' . $page if $page =~ /^Image:/i;
+	$linkpage = ':' . $page if $page =~ /^Image:/i;
 
 	print FH "{{-start-}}\n'''Template:WPContrib/$normpage'''\n";
 	print FH "== $page - Wikipedia Contributors ==\n\n";
@@ -452,7 +453,7 @@ sub do_query
 			#write_file ($file, $res->content);
 		}
 		else {
-			return $res->content;
+			return $xml;
 		}
 	}
 	else {
