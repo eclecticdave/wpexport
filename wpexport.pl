@@ -8,8 +8,11 @@
 #   --merge     Retrieves matching pages from encoresoup into es.txt to facilitate manual merging.
 #   --file      Specifies File containing list of page titles, one per line.
 #   --page      Specifies Page Title to retrieve.
-#   --imagehash Image files will be downloaded to subdirectories based on MD5 hash on filename.
-#               (mirroring structure expected by mediawiki software - not really useful for non-admins)
+#   --imagehash Image files will be downloaded to subdirectories based on MD5
+#               hash on filename. (mirroring structure expected by mediawiki
+#               software - not really useful for non-admins)
+#   --getimages Image pages and files linked from current page will also be
+#               downloaded.
 #
 #   One of --file or --page must be supplied
 #
@@ -66,11 +69,12 @@ Getopt::Long::Configure("bundling");
 GetOptions (\%opts,
   'merge',
 	'imagehash',
+	'getimages',
   'file=s',
   'page=s'
 ) or die("$usage\nInvalid Option\n");
 
-map { $opts{$_} = 0 if !exists($opts{$_}) } qw/merge imagehash/;
+map { $opts{$_} = 0 if !exists($opts{$_}) } qw/merge imagehash getimages/;
 
 # Create a user agent object
 $ua = LWP::UserAgent->new;
@@ -91,9 +95,21 @@ else {
 	print STDERR "Either --file or --page must be supplied\n\n";
 }
 
-for my $page (@pages) {
+# while loop - allows for additional pages to be pushed onto the end of @pages;
+while ($page = shift @pages) {
+	process_page($page);
+}
+
+exit 0;
+
+sub process_page
+{
+	my $page = shift;
+
 	my $isimage;
 	my $filter;
+
+	undef %tmplflds;
 
 	chomp $page;
 
@@ -218,18 +234,21 @@ for my $page (@pages) {
 		create_release_template($page, 'Latest_preview_release', $wp_latest_preview_version, $wp_latest_preview_date);
 	}
 
-	# Do Wikipedia Revision Info Export
-	get_contributors($page);
+	my $image_src;
 
 	# If we are getting a Image: page, then go get the corresponding image file
-	get_image($page) if ($isimage);
-}
+	$image_src = get_image($page) if ($isimage);
 
-exit 0;
+	# Do Wikipedia Revision Info Export
+	if (!$isimage || $image_src ne 'F') {
+		get_contributors($page, $image_src);
+	}
+}
 
 sub get_contributors
 {
 	my $page = shift;
+	my $image_src = shift;
 
 	print "\tExporting Contributors from Wikipedia...\n";
 
@@ -238,7 +257,11 @@ sub get_contributors
 	open FH, ">>:utf8", $file;
 
 	my %contribs;
-	my $wpapi = "http://en.wikipedia.org/w/api.php";
+
+	# Get details from Wikimedia commons if we just got an image from there.
+	my $wpapi;
+	$wpapi = ($image_src eq 'CO') ? "http://commons.wikimedia.org/w/api.php"
+				 : "http://en.wikipedia.org/w/api.php";
 	my $q = "action=query&prop=revisions&titles=$page&rvlimit=max&rvprop=user&format=xml";
 	my $xml = do_query($wpapi, $q);
 	$revstartid = parse_rev_xml($xml, \%contribs);
@@ -362,6 +385,12 @@ sub process_text
 
 		# Comment out language links
 		$text =~ s/\[\[([a-z][a-z]|ast|simple):([^\]]*)\]\]/<!--[[$1:$2]]-->/gi;
+
+		# Identify Images
+		if ($opts{getimages}) {
+			my @images = ($text =~ /\[\[(Image:[^\|\]]+)/gi);
+			map { s/[^[:ascii:]]+//g; push @pages, $_; } @images;
+		}
 
 		# Remove templates not used on Encoresoup
 		$text =~ s/\{\{notability[^\}]*\}\}//gi;
@@ -565,6 +594,9 @@ sub get_image
 	# Remove Image: prefix
 	$page =~ s/^Image://i;
 
+	# Normalise image name
+	$page =~ s/\s/_/g;
+
 	# Create image subdirectory if necessary
 	mkdir "images" unless -d "images";
 
@@ -573,12 +605,13 @@ sub get_image
 	my ($prefix1) = $md5 =~ /^(.)/;
 	my ($prefix2) = $md5 =~ /^(..)/;
 
+	$wppath = "$prefix1/$prefix2/$page";
+
 	if ($opts{imagehash}) {
 		# Create image hash directories if necessary
 		mkdir "images/$prefix1" unless -d "images/$prefix1";
 		mkdir "images/$prefix1/$prefix2" unless -d "images/$prefix1/$prefix2";
 
-		$wppath = "$prefix1/$prefix2/$page";
 		$espath = "images/$wppath";
 	}
 	else {
@@ -597,7 +630,7 @@ sub get_image
 	}
 	else {
 		print "SUCCESS: $url => '$espath'\n\n";
-		return;
+		return 'WP';
 	}
 
 	print "Trying Wikimedia Commons ...\n";
@@ -614,5 +647,8 @@ sub get_image
 	}
 	else {
 		print "SUCCESS: $url => '$espath'\n\n";
+		return 'CO';
 	}
+
+	return 'F';
 }
