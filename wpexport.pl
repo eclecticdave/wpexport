@@ -138,7 +138,15 @@ sub process_page
 
 	# Parse the XML.
 	parse_export_xml($esxml, "es.txt", 0) if ($opts{merge});
-	parse_export_xml($wpxml, "wp.txt", $filter);
+
+	my $text = parse_export_xml($wpxml, "wp.txt", $filter);
+	if (!defined $text) {
+		# undef returned only for images, where 'missing' attributes is set.
+		# - indicates image description is on Wikimedia Commons.
+		print "\tExporting From Wikimedia Commons\n";
+		my $wpxml = export_page('CO', $page);
+		parse_export_xml($wpxml, "wp.txt", $filter);
+	}
 
 	# Extract Versions from WP Page.
 	my $wp_latest_release_version = '';
@@ -304,13 +312,21 @@ sub parse_export_xml
 	my $title = "";
 	my $text = "";
 	my $rev = "";
+	my $missing = 0;
 
 	my $twig = XML::Twig->new(
 	 	twig_handlers =>
 			{ 
 			  'revisions/rev' => sub { $rev = $_->text; },
 				'page' => sub
-					{ $title = $_->att('title');
+					{ 
+						# If missing attribute set, then discard this page and return undef.
+						if (exists $_->atts->{missing}) {
+							$missing = 1;
+							return;
+						}
+					
+						$title = $_->att('title');
 					  $text .= "{{-start-}}\n'''" . $title . "'''\n";
 						$pages{$title}[$filter] = process_text($title, $rev, $filter);
 						$text .= $pages{$title}[$filter] . "\n{{-stop-}}\n";
@@ -319,6 +335,8 @@ sub parse_export_xml
 		pretty_print => 'indented'
 	);
 	$twig->parse($xml);
+
+	return undef if $missing;
 
 	if ($file) {
 		open(FH, ">>:utf8", $file);
@@ -412,7 +430,7 @@ sub process_text
 
 		# Identify Images
 		if ($opts{getimages}) {
-			my @images = ($text =~ /\[\[(Image:[^\|\]]+)/gi);
+			my @images = ($text =~ /\[\[(Image:[^\#\|\]]+)/gi);
 			map { s/[^[:ascii:]]+//g; push @pages, $_; } @images;
 		}
 
@@ -474,9 +492,10 @@ sub export_page
 	my $esurl = "http://encoresoup.net/index.php";
 	my $wpapi = "http://en.wikipedia.org/w/api.php";
 	my $esapi = "http://encoresoup.net/api.php";
+	my $coapi = "http://commons.wikimedia.org/w/api.php";
 
-	#my $url = ($site eq 'WP') ? $wpurl : $esurl;
-	my $url = ($site eq 'WP') ? $wpapi : $esapi;
+	my $url = ($site eq 'WP') ? $wpapi
+		: ($site eq 'CO') ? $coapi : $esapi;
 
 	my $q = "action=query&prop=revisions&titles=$page&rvlimit=1&rvprop=content&redirects=1&format=xml";
 	#my $q = "title=Special:Export&curonly=1&limit=1&dir=desc&redirects=1&pages=$page";
@@ -510,7 +529,7 @@ sub do_query
 		}
 	}
 	else {
-		 print $res->status_line, "\n";
+		 print STDERR $res->status_line, "\n";
 		 return undef;
 	}
 }
