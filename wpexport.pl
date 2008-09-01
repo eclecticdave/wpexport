@@ -13,6 +13,8 @@
 #               software - not really useful for non-admins)
 #   --getimages Image pages and files linked from current page will also be
 #               downloaded.
+#		--keeplinks	Specifies file containing list of page titles, one per line.
+#		            Links pointing to these pages will be not be delinked.
 #
 #   One of --file or --page must be supplied
 #
@@ -71,7 +73,8 @@ GetOptions (\%opts,
 	'imagehash',
 	'getimages',
   'file=s',
-  'page=s'
+  'page=s',
+	'keeplinks=s'
 ) or die("$usage\nInvalid Option\n");
 
 map { $opts{$_} = 0 if !exists($opts{$_}) } qw/merge imagehash getimages/;
@@ -93,6 +96,11 @@ elsif ($opts{page}) {
 }
 else {
 	print STDERR "Either --file or --page must be supplied\n\n";
+}
+
+my %keeplinks;
+if ($opts{keeplinks}) {
+	%keeplinks = map { chomp; s/^\s*//; s/\s*$//; lc $_ => 1 } read_file($opts{keeplinks});
 }
 
 # while loop - allows for additional pages to be pushed onto the end of @pages;
@@ -348,6 +356,22 @@ sub parse_rev_xml
 	return $revstartid;
 }
 
+sub process_link
+{
+	my $link = shift;
+	my $desc = shift;
+
+	$link =~ s/^\s*//;
+	$link =~ s/\s*$//;
+
+	if ($keeplinks{lc $link}) {
+		return (defined $desc) ? "[[$link|$desc]]" : "[[$link]]";
+	}
+	else {
+		return (defined $desc) ? $desc : $link;
+	}
+}
+
 sub process_text
 {
 	my $title = shift;
@@ -358,8 +382,8 @@ sub process_text
 		# Processing Wikipedia Extract ...
 
 		# Unlink Wiki-links
-		$text =~ s/\[\[[^\]:]*?\|(.*?)\]\]/\1/g;
-		$text =~ s/\[\[([^\]:]*?)\]\]/\1/g;
+		$text =~ s/\[\[([^\]:]*?)\|(.*?)\]\]/&process_link($1,$2)/ge;
+		$text =~ s/\[\[([^\]:]*?)\]\]/&process_link($1)/ge;
 
 		# Add Wikipedia-Attrib template for comparison purposes.
 		$text = "{{Wikipedia-Attrib|$title}}" . $text;
@@ -596,6 +620,8 @@ sub get_image
 
 	# Normalise image name
 	$page =~ s/\s/_/g;
+	my ($initial, $rest) = $page =~ /^(.)(.*)$/;
+	$page = uc($initial) . $rest;
 
 	# Create image subdirectory if necessary
 	mkdir "images" unless -d "images";
