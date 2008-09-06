@@ -100,7 +100,7 @@ else {
 
 my %keeplinks;
 if ($opts{keeplinks}) {
-	%keeplinks = map { chomp; s/^\s*//; s/\s*$//; lc $_ => 1 } read_file($opts{keeplinks});
+	build_keeplinks($opts{keeplinks}, \@pages);
 }
 
 # while loop - allows for additional pages to be pushed onto the end of @pages;
@@ -697,3 +697,53 @@ sub get_image
 
 	return 'F';
 }
+
+sub build_keeplinks
+{
+	my $file = shift;
+	my $pagesref = shift;
+
+	
+	# Get links from file and add pages to export to ensure we also keep these links too.
+	for my $link (read_file($file),@$pagesref) {
+		$link =~ s/^\s*//;
+		$link =~ s/\s*$//;
+		$keeplinks{lc $link} = 1;
+
+		# Now find all redirects for this link and add these too.
+		my $wpapi =  "http://en.wikipedia.org/w/api.php";
+		my $q = "action=query&list=backlinks&bltitle=$link&bllimit=max&blfilterredir=redirects&format=xml";
+		my $xml = do_query($wpapi, $q);
+
+		do {
+			my ($cont, @redirs) = parse_redir_xml($xml);
+			map { s/^\s*//; s/\s*$//; $keeplinks{lc $_} = 1 } @redirs;
+		} while ($cont);
+	}
+}
+
+sub parse_redir_xml
+{
+	my $xml = shift;
+
+	my $cont = "";
+	my @titles;
+
+	my $twig = XML::Twig->new(
+	 	twig_handlers =>
+			{ 'backlinks/bl' => sub
+					{ 
+						push @titles, $_->att('title');
+					},
+			  'query-continue/backlinks' => sub
+					{ 
+						$cont = $_->att('blcontinue');
+					}
+			},
+		pretty_print => 'indented'
+	);
+	$twig->parse($xml);
+
+	return ($cont, @titles);
+}
+
