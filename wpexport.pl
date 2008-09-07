@@ -8,6 +8,7 @@
 #   --merge     Retrieves matching pages from encoresoup into es.txt to facilitate manual merging.
 #   --file      Specifies File containing list of page titles, one per line.
 #   --page      Specifies Page Title to retrieve.
+#   --allpages	Retrieve list of all pages from Encoresoup and use it in place of --file
 #   --imagehash Image files will be downloaded to subdirectories based on MD5
 #               hash on filename. (mirroring structure expected by mediawiki
 #               software - not really useful for non-admins)
@@ -15,6 +16,9 @@
 #               downloaded.
 #		--keeplinks	Specifies file containing list of page titles, one per line.
 #		            Links pointing to these pages will be not be delinked.
+#   --redirects Export redirects pointing to required pages.
+#   --rebuild-klcache Rebuild the keeplinks.cache file for given keeplinks file, add redirects if 
+#                     --redirects is also specified.
 #
 #   One of --file or --page must be supplied
 #
@@ -62,6 +66,7 @@ use Getopt::Long;
 use MD5;
 use Term::ProgressBar;
 
+binmode STDOUT, ':utf8';
 $| = 1;
 
 my %cats;
@@ -77,11 +82,13 @@ GetOptions (\%opts,
 	'getimages',
   'file=s',
   'page=s',
-	'keeplinks=s',
-	'redirects'
+	'keeplinks:s',
+	'redirects',
+	'rebuild-klcache',
+	'allpages'
 ) or die("$usage\nInvalid Option\n");
 
-map { $opts{$_} = 0 if !exists($opts{$_}) } qw/merge imagehash getimages redirects/;
+map { $opts{$_} = 0 if !exists($opts{$_}) } qw/merge imagehash getimages redirects rebuild-klcache allpages/;
 
 # Create a user agent object
 $ua = LWP::UserAgent->new;
@@ -98,26 +105,36 @@ if ($opts{file}) {
 elsif ($opts{page}) {
 	@pages = ($opts{page});
 }
+elsif ($opts{allpages}) {
+	@pages = allpages();
+}
 else {
-	print STDERR "Either --file or --page must be supplied\n\n";
+	print STDERR "Either --file, --page or --allpages must be supplied\n\n";
 }
 
 my %keeplinks;
-if ($opts{keeplinks}) {
-	my @keeplinks = map { chomp; s/^\s*//; s/\s*$//; $_ } (read_file($opts{keeplinks}), @pages);
+if (exists $opts{keeplinks}) {
+	my $klfile = ($opts{keeplinks}) ? $opts{keeplinks} : 'keeplinks.cache';
+	
+	my @keeplinks = map { chomp; s/^\s*//; s/\s*$//; $_ } (read_file($klfile), @pages);
 	%keeplinks = map { lc $_ => 1 } (@keeplinks);
 
-	if ($opts{redirects}) {
-		print "Getting redirects for keeplinks pages\n";
-		my $progress = Term::ProgressBar->new({count => scalar(@keeplinks), ETA => 'linear'});
-		for (my $i = 0; $i < @keeplinks; $i++) {
-			my $link = $keeplinks[$i];
-			my @redirs = get_redirects($link);
-			map { $keeplinks {lc $_} = 1 } (@redirs);
-			$progress->update();
+	if ($opts{'rebuild-klcache'}) {
+		if ($opts{redirects}) {
+			print "Getting redirects for keeplinks pages\n";
+			my $progress = Term::ProgressBar->new({count => scalar(@keeplinks), ETA => 'linear'});
+			for (my $i = 0; $i < @keeplinks; $i++) {
+				my $link = $keeplinks[$i];
+				my @redirs = get_redirects($link);
+				map { $keeplinks {lc $_} = 1 } (@redirs);
+				$progress->update();
+			}
+
+			open FH, ">:utf8", "keeplinks.cache";
+			print FH join("\n", sort keys %keeplinks);
+			close FH;
 		}
 	}
-
 }
 
 # while loop - allows for additional pages to be pushed onto the end of @pages;
@@ -752,8 +769,9 @@ sub get_redirects
 	my $q = "action=query&list=backlinks&bltitle=$page&bllimit=max&blfilterredir=redirects&format=xml";
 	my $xml = do_query($wpapi, $q);
 
+	my ($cont, @redirs);
 	do {
-		my ($cont, @redirs) = parse_redir_xml($xml);
+		($cont, @redirs) = parse_redir_xml($xml);
 		map { chomp;  s/^\s*//; s/\s*$//; push @redirects, $_ } @redirs;
 
 		$xml = do_query($wpapi, $q . '&blcontinue=' . $cont) if $cont;
@@ -778,6 +796,52 @@ sub parse_redir_xml
 			  'query-continue/backlinks' => sub
 					{ 
 						$cont = $_->att('blcontinue');
+					}
+			},
+		pretty_print => 'indented'
+	);
+	$twig->parse($xml);
+
+	return ($cont, @titles);
+}
+
+sub allpages
+{
+	# Get all page titles. 
+	my $esapi =  "http://encoresoup.net/api.php";
+	my $q = "action=query&list=allpages&aplimit=max&apfilterredir=nonredirects&format=xml";
+	my $xml = do_query($esapi, $q);
+
+	my @allpages;
+
+	my ($cont, @redirs);
+	do {
+		($cont, @pages) = parse_allpages_xml($xml);
+		map { chomp;  s/^\s*//; s/\s*$//; push @allpages, $_ } @pages;
+
+		$xml = do_query($esapi, $q . '&apfrom=' . $cont) if $cont;
+	} while ($cont);
+
+	print scalar @allpages . " Page Titles\n";
+	return @allpages;
+}
+
+sub parse_allpages_xml
+{
+	my $xml = shift;
+
+	my $cont = "";
+	my @titles;
+
+	my $twig = XML::Twig->new(
+	 	twig_handlers =>
+			{ 'allpages/p' => sub
+					{ 
+						push @titles, $_->att('title');
+					},
+			  'query-continue/allpages' => sub
+					{ 
+						$cont = $_->att('apfrom');
 					}
 			},
 		pretty_print => 'indented'
