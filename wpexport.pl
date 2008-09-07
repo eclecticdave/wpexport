@@ -60,6 +60,9 @@ use Text::Balanced qw ( extract_bracketed );
 use Date::Manip;
 use Getopt::Long;
 use MD5;
+use Term::ProgressBar;
+
+$| = 1;
 
 my %cats;
 my %tmplflds;
@@ -74,10 +77,11 @@ GetOptions (\%opts,
 	'getimages',
   'file=s',
   'page=s',
-	'keeplinks=s'
+	'keeplinks=s',
+	'redirects'
 ) or die("$usage\nInvalid Option\n");
 
-map { $opts{$_} = 0 if !exists($opts{$_}) } qw/merge imagehash getimages/;
+map { $opts{$_} = 0 if !exists($opts{$_}) } qw/merge imagehash getimages redirects/;
 
 # Create a user agent object
 $ua = LWP::UserAgent->new;
@@ -89,7 +93,7 @@ unlink "es.txt" if $opts{merge};
 
 my @pages;
 if ($opts{file}) {
-	@pages = read_file($opts{file});
+	@pages = map { chomp;  s/^\s*//; s/\s*$//; $_ } read_file($opts{file});
 }
 elsif ($opts{page}) {
 	@pages = ($opts{page});
@@ -100,7 +104,20 @@ else {
 
 my %keeplinks;
 if ($opts{keeplinks}) {
-	build_keeplinks($opts{keeplinks}, \@pages);
+	my @keeplinks = map { chomp; s/^\s*//; s/\s*$//; $_ } (read_file($opts{keeplinks}), @pages);
+	%keeplinks = map { lc $_ => 1 } (@keeplinks);
+
+	if ($opts{redirects}) {
+		print "Getting redirects for keeplinks pages\n";
+		my $progress = Term::ProgressBar->new({count => scalar(@keeplinks), ETA => 'linear'});
+		for (my $i = 0; $i < @keeplinks; $i++) {
+			my $link = $keeplinks[$i];
+			my @redirs = get_redirects($link);
+			map { $keeplinks {lc $_} = 1 } (@redirs);
+			$progress->update();
+		}
+	}
+
 }
 
 # while loop - allows for additional pages to be pushed onto the end of @pages;
@@ -259,6 +276,13 @@ sub process_page
 	if (!$isimage || $image_src ne 'F') {
 		get_contributors($page, $image_src);
 	}
+
+	# Add redirects
+	print "\tCreating Redirect Pages\n";
+	if ($opts{redirects}) {
+		my @redirs = get_redirects($page);
+		map { create_redirect_text($page, $_) } @redirs;
+	}
 }
 
 sub get_contributors
@@ -401,7 +425,7 @@ sub process_text
 
 		# Unlink Wiki-links
 		$text =~ s/\[\[([^\]:]*?)\|(.*?)\]\]/&process_link($1,$2)/ge;
-		$text =~ s/\[\[([^\]:]*?)\]\]/&process_link($1)/ge;
+		$text =~ s/\[\[([^\]\|:]*?)\]\]/&process_link($1)/ge;
 
 		# Add Wikipedia-Attrib template for comparison purposes.
 		$text = "{{Wikipedia-Attrib|$title}}" . $text;
@@ -498,7 +522,6 @@ sub export_page
 		: ($site eq 'CO') ? $coapi : $esapi;
 
 	my $q = "action=query&prop=revisions&titles=$page&rvlimit=1&rvprop=content&redirects=1&format=xml";
-	#my $q = "title=Special:Export&curonly=1&limit=1&dir=desc&redirects=1&pages=$page";
 	return do_query($url, $q, $file);
 }
 
@@ -627,6 +650,26 @@ EOF
 	close FH
 }
 
+sub create_redirect_text
+{
+	my $page = shift;
+	my $redir = shift;
+
+	my $file = 'es.txt';
+
+	open FH, ">>:utf8", $file;
+
+	print FH <<EOF
+{{-start-}}
+'''$redir'''
+#REDIRECT [[$page]]
+{{-stop-}}
+EOF
+;
+
+	close FH
+}
+
 sub get_image
 {
 	my $page = shift;
@@ -698,28 +741,25 @@ sub get_image
 	return 'F';
 }
 
-sub build_keeplinks
+sub get_redirects
 {
-	my $file = shift;
-	my $pagesref = shift;
+	my $page = shift;
 
-	
-	# Get links from file and add pages to export to ensure we also keep these links too.
-	for my $link (read_file($file),@$pagesref) {
-		$link =~ s/^\s*//;
-		$link =~ s/\s*$//;
-		$keeplinks{lc $link} = 1;
+	my @redirects;
 
-		# Now find all redirects for this link and add these too.
-		my $wpapi =  "http://en.wikipedia.org/w/api.php";
-		my $q = "action=query&list=backlinks&bltitle=$link&bllimit=max&blfilterredir=redirects&format=xml";
-		my $xml = do_query($wpapi, $q);
+	# Get all redirects for page.
+	my $wpapi =  "http://en.wikipedia.org/w/api.php";
+	my $q = "action=query&list=backlinks&bltitle=$page&bllimit=max&blfilterredir=redirects&format=xml";
+	my $xml = do_query($wpapi, $q);
 
-		do {
-			my ($cont, @redirs) = parse_redir_xml($xml);
-			map { s/^\s*//; s/\s*$//; $keeplinks{lc $_} = 1 } @redirs;
-		} while ($cont);
-	}
+	do {
+		my ($cont, @redirs) = parse_redir_xml($xml);
+		map { chomp;  s/^\s*//; s/\s*$//; push @redirects, $_ } @redirs;
+
+		$xml = do_query($wpapi, $q . '&blcontinue=' . $cont) if $cont;
+	} while ($cont);
+
+	return @redirects;
 }
 
 sub parse_redir_xml
