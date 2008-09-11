@@ -20,7 +20,7 @@
 #   --rebuild-klcache Rebuild the keeplinks.cache file for given keeplinks file, add redirects if 
 #                     --redirects is also specified.
 #
-#   One of --file or --page must be supplied
+#   One of --file, --page or --allpages must be supplied
 #
 #   Output is one or more text files in suitable format for pywikipedia's pagefromfile script.  If pages
 #   from the Image namespace are specified, the image files will also be created in the 'images' subdirectory.
@@ -56,6 +56,8 @@
 # http://www.gnu.org/copyleft/gpl.html
 # 
 
+use strict;
+
 use File::Basename;
 use File::Slurp;
 use LWP::UserAgent;
@@ -65,6 +67,7 @@ use Date::Manip;
 use Getopt::Long;
 use MD5;
 use Term::ProgressBar;
+use MediaWiki::API;
 
 binmode STDOUT, ':utf8';
 $| = 1;
@@ -75,6 +78,7 @@ my %tmplflds;
 my $script=basename($0);
 my $usage="Usage: $script [--<opts>]";
 
+my %opts;
 Getopt::Long::Configure("bundling");
 GetOptions (\%opts,
   'merge',
@@ -91,8 +95,11 @@ GetOptions (\%opts,
 map { $opts{$_} = 0 if !exists($opts{$_}) } qw/merge imagehash getimages redirects rebuild-klcache allpages/;
 
 # Create a user agent object
-$ua = LWP::UserAgent->new;
+my $ua = LWP::UserAgent->new;
 $ua->agent("WPExport/0.1 ");
+
+# Create MediaWiki::API objects
+my $esobj = MediaWiki::API->new( { api_url => 'http://encoresoup.net/api.php' } );
 
 unlink "wp.txt";
 unlink "esplus.txt";
@@ -125,7 +132,7 @@ if (exists $opts{keeplinks}) {
 			my $progress = Term::ProgressBar->new({count => scalar(@keeplinks), ETA => 'linear'});
 			for (my $i = 0; $i < @keeplinks; $i++) {
 				my $link = $keeplinks[$i];
-				my @redirs = get_redirects($link);
+				my @redirs = get_redirects($link,'WP',0);
 				map { $keeplinks {lc $_} = 1 } (@redirs);
 				$progress->update();
 			}
@@ -138,7 +145,7 @@ if (exists $opts{keeplinks}) {
 }
 
 # while loop - allows for additional pages to be pushed onto the end of @pages;
-while ($page = shift @pages) {
+while (my $page = shift @pages) {
 	process_page($page);
 }
 
@@ -158,28 +165,82 @@ sub process_page
 	print "Processing Page: $page\n";
 
 	$isimage = ($page =~ /^Image:/i) ? 1 : 0;
+	$filter = ($isimage) ? 3 : 1;
+
+	# Get Details from Encoresoup for merging.
+	my $esxml;
+	my $es_latest_release_version = '';
+	my $es_latest_release_date = '';
+	my $es_latest_preview_version = '';
+	my $es_latest_preview_date = '';
+	my $espage = '';
+	if ($opts{merge}) {
+		print "\tExporting From Encoresoup\n";
+		$esxml = export_page('ES', $page);
+
+		# Parse the XML.
+		my $estext = parse_export_xml($esxml, "es.txt", 0);
+
+		# Get Encoresoup Version Templates
+		undef %tmplflds;
+		my $esver = export_page('ES', "Template:Latest_stable_release/$page");
+		parse_export_xml($esver, undef, 2);
+
+		if (exists $tmplflds{release_version}) {
+			$es_latest_release_version = $tmplflds{release_version};
+			print "\tES: Latest Release Version: $es_latest_release_version\n";
+		}
+		if (exists $tmplflds{release_date}) {
+			$es_latest_release_date = $tmplflds{release_date};
+			print "\tES: Latest Release Date: $es_latest_release_date\n";
+		}
+
+		undef %tmplflds;
+		$esver = export_page('ES', "Template:Latest_preview_release/$page");
+		parse_export_xml($esver, undef, 2);
+
+		if (exists $tmplflds{release_version}) {
+			$es_latest_preview_version = $tmplflds{release_version};
+			print "\tES: Latest Preview Version: $es_latest_preview_version\n";
+		}
+		if (exists $tmplflds{release_date}) {
+			$es_latest_preview_date = $tmplflds{release_date};
+			print "\tES: Latest Preview Date: $es_latest_preview_date\n";
+		}
+
+		# Add redirects
+		if ($opts{redirects}) {
+			my @redirs = get_redirects($page,'ES',1);
+			map { create_redirect_text($page, 'ES', $_) } @redirs;
+		}
+
+		# Change page name to retrieve from Wikipedia if {{Wikipedia-Attrib}} template is used.
+		my ($wppage) = $estext =~ /\{\{Wikipedia-Attrib\|(.*?)\}\}/i;
+
+		if ($page ne $wppage) {
+			print "\tPage On Wikipedia: $wppage\n";
+			$espage = $page;
+			$page = $wppage;
+		}
+	}
 
 	print "\tExporting From Wikipedia\n";
 	my $wpxml = export_page('WP', $page);
 
-	my $esxml;
-	if ($opts{merge}) {
-		print "\tExporting From Encoresoup\n";
-		$esxml = export_page('ES', $page);
-	}
-
-	$filter = ($isimage) ? 3 : 1;
-
-	# Parse the XML.
-	parse_export_xml($esxml, "es.txt", 0) if ($opts{merge});
-
-	my $text = parse_export_xml($wpxml, "wp.txt", $filter);
+	# Pass in reference to $realpage, gets correct title if we supplied a redirect.
+	my $realpage;
+	my $text = parse_export_xml($wpxml, "wp.txt", $filter, \$realpage);
 	if (!defined $text) {
 		# undef returned only for images, where 'missing' attributes is set.
 		# - indicates image description is on Wikimedia Commons.
 		print "\tExporting From Wikimedia Commons\n";
 		my $wpxml = export_page('CO', $page);
 		parse_export_xml($wpxml, "wp.txt", $filter);
+	}
+
+	if ($page ne $realpage) {
+		print "\tActual Page Title: $realpage\n";
+		$page = $realpage;
 	}
 
 	# Extract Versions from WP Page.
@@ -236,41 +297,6 @@ sub process_page
 		}
 	}
 
-	my $es_latest_release_version = '';
-	my $es_latest_release_date = '';
-	my $es_latest_preview_version = '';
-	my $es_latest_preview_date = '';
-
-	if ($opts{merge}) {
-		# Get Encoresoup Version Templates
-		
-		undef %tmplflds;
-		my $esver = export_page('ES', "Template:Latest_stable_release/$page");
-		parse_export_xml($esver, undef, 2);
-
-		if (exists $tmplflds{release_version}) {
-			$es_latest_release_version = $tmplflds{release_version};
-			print "\tES: Latest Release Version: $es_latest_release_version\n";
-		}
-		if (exists $tmplflds{release_date}) {
-			$es_latest_release_date = $tmplflds{release_date};
-			print "\tES: Latest Release Date: $es_latest_release_date\n";
-		}
-
-		undef %tmplflds;
-		$esver = export_page('ES', "Template:Latest_preview_release/$page");
-		parse_export_xml($esver, undef, 2);
-
-		if (exists $tmplflds{release_version}) {
-			$es_latest_preview_version = $tmplflds{release_version};
-			print "\tES: Latest Preview Version: $es_latest_preview_version\n";
-		}
-		if (exists $tmplflds{release_date}) {
-			$es_latest_preview_date = $tmplflds{release_date};
-			print "\tES: Latest Preview Date: $es_latest_preview_date\n";
-		}
-	}
-
 	# Create Release templates for versions if they exist on WP and are different to on ES (always true if ES
 	# versions not retrieved)
 	if (($wp_latest_release_version && ($es_latest_release_version ne $wp_latest_release_version))
@@ -295,10 +321,11 @@ sub process_page
 	}
 
 	# Add redirects
-	print "\tCreating Redirect Pages\n";
 	if ($opts{redirects}) {
-		my @redirs = get_redirects($page);
-		map { create_redirect_text($page, $_) } @redirs;
+		print "\tCreating Redirect Pages\n";
+		my @redirs = get_redirects($page,'WP',1);
+		# Redirect should point to page on Encoresoup, if different to Wikipedia Title.
+		map { create_redirect_text(($espage) ? $espage : $page, 'WP', $_) } @redirs;
 	}
 }
 
@@ -321,7 +348,7 @@ sub get_contributors
 				 : "http://en.wikipedia.org/w/api.php";
 	my $q = "action=query&prop=revisions&titles=$page&rvlimit=max&rvprop=user&format=xml";
 	my $xml = do_query($wpapi, $q);
-	$revstartid = parse_rev_xml($xml, \%contribs);
+	my $revstartid = parse_rev_xml($xml, \%contribs);
 	while($revstartid != 0) {
 		$xml = do_query($wpapi, $q . '&rvstartid=' . $revstartid);
 		$revstartid = parse_rev_xml($xml, \%contribs);
@@ -349,11 +376,14 @@ sub parse_export_xml
 	my $xml = shift;
 	my $file = shift;
 	my $filter = shift;
+	my $realpage = shift; # Must be a reference;
 
 	my $title = "";
 	my $text = "";
 	my $rev = "";
 	my $missing = 0;
+
+	my %pages;
 
 	my $twig = XML::Twig->new(
 	 	twig_handlers =>
@@ -384,6 +414,8 @@ sub parse_export_xml
 		print FH $text;
 		close FH;
 	}
+
+	$$realpage = $title if defined $realpage && ref $realpage;
 
 	return $text;
 }
@@ -529,8 +561,6 @@ sub export_page
 	my $page = shift;
 	my $file = shift;
 
-	my $wpurl = "http://en.wikipedia.org/w/index.php";
-	my $esurl = "http://encoresoup.net/index.php";
 	my $wpapi = "http://en.wikipedia.org/w/api.php";
 	my $esapi = "http://encoresoup.net/api.php";
 	my $coapi = "http://commons.wikimedia.org/w/api.php";
@@ -562,7 +592,6 @@ sub do_query
 			open FH, '>:utf8', $file;
 			print FH $xml;
 			close FH;
-			#write_file ($file, $res->content);
 		}
 		else {
 			return $xml;
@@ -670,9 +699,10 @@ EOF
 sub create_redirect_text
 {
 	my $page = shift;
+	my $site = shift;
 	my $redir = shift;
 
-	my $file = 'es.txt';
+	my $file = ($site eq 'WP') ? 'wp.txt' : 'es.txt';
 
 	open FH, ">>:utf8", $file;
 
@@ -761,17 +791,22 @@ sub get_image
 sub get_redirects
 {
 	my $page = shift;
+	my $site = shift;
+	my $verbose = shift;
 
 	my @redirects;
 
 	# Get all redirects for page.
-	my $wpapi =  "http://en.wikipedia.org/w/api.php";
+	my $wpapi = "http://en.wikipedia.org/w/api.php";
+	my $esapi = "http://encoresoup.net/api.php";
+
+	my $url = ($site eq 'WP') ? $wpapi : $esapi;
 	my $q = "action=query&list=backlinks&bltitle=$page&bllimit=max&blfilterredir=redirects&format=xml";
-	my $xml = do_query($wpapi, $q);
+	my $xml = do_query($url, $q);
 
 	my ($cont, @redirs);
 	do {
-		($cont, @redirs) = parse_redir_xml($xml);
+		($cont, @redirs) = parse_redir_xml($xml, $verbose);
 		map { chomp;  s/^\s*//; s/\s*$//; push @redirects, $_ } @redirs;
 
 		$xml = do_query($wpapi, $q . '&blcontinue=' . $cont) if $cont;
@@ -783,6 +818,7 @@ sub get_redirects
 sub parse_redir_xml
 {
 	my $xml = shift;
+	my $verbose = shift;
 
 	my $cont = "";
 	my @titles;
@@ -792,6 +828,7 @@ sub parse_redir_xml
 			{ 'backlinks/bl' => sub
 					{ 
 						push @titles, $_->att('title');
+						print "\t\tFound Redirect: " . $_->att('title') . "\n" if $verbose;
 					},
 			  'query-continue/backlinks' => sub
 					{ 
@@ -808,19 +845,26 @@ sub parse_redir_xml
 sub allpages
 {
 	# Get all page titles. 
-	my $esapi =  "http://encoresoup.net/api.php";
-	my $q = "action=query&list=allpages&aplimit=max&apfilterredir=nonredirects&format=xml";
-	my $xml = do_query($esapi, $q);
+	#my $esapi =  "http://encoresoup.net/api.php";
+	#my $q = "action=query&list=allpages&aplimit=max&apfilterredir=nonredirects&format=xml";
+	#my $xml = do_query($esapi, $q);
 
 	my @allpages;
 
-	my ($cont, @redirs);
-	do {
-		($cont, @pages) = parse_allpages_xml($xml);
-		map { chomp;  s/^\s*//; s/\s*$//; push @allpages, $_ } @pages;
+	$esobj->list( { action => 'query',
+									list => 'allpages',
+									aplimit => 'max',
+									apfilterredir => 'nonredirects'
+								}, { hook => sub { my $ref = shift; map { chomp;  s/^\s*//; s/\s*$//; push @allpages, $_ } @$ref; } }
+							);
 
-		$xml = do_query($esapi, $q . '&apfrom=' . $cont) if $cont;
-	} while ($cont);
+	#my ($cont, @redirs);
+#	do {
+#		($cont, @pages) = parse_allpages_xml($xml);
+#		map { chomp;  s/^\s*//; s/\s*$//; push @allpages, $_ } @pages;
+
+#		$xml = do_query($esapi, $q . '&apfrom=' . $cont) if $cont;
+#	} while ($cont);
 
 	print scalar @allpages . " Page Titles\n";
 	return @allpages;
