@@ -68,12 +68,14 @@ use Getopt::Long;
 use MD5;
 use Term::ProgressBar;
 use MediaWiki::API;
+use DBI;
 
 binmode STDOUT, ':utf8';
 $| = 1;
 
 my %cats;
 my %tmplflds;
+my %meta;
 
 my $script=basename($0);
 my $usage="Usage: $script [--<opts>]";
@@ -81,6 +83,8 @@ my $usage="Usage: $script [--<opts>]";
 my %opts;
 Getopt::Long::Configure("bundling");
 GetOptions (\%opts,
+	'db=s',
+	'init',
   'merge',
 	'imagehash',
 	'getimages',
@@ -92,7 +96,7 @@ GetOptions (\%opts,
 	'allpages'
 ) or die("$usage\nInvalid Option\n");
 
-map { $opts{$_} = 0 if !exists($opts{$_}) } qw/merge imagehash getimages redirects rebuild-klcache allpages/;
+map { $opts{$_} = 0 if !exists($opts{$_}) } qw/merge imagehash getimages redirects rebuild-klcache allpages init/;
 
 # Create a user agent object
 my $ua = LWP::UserAgent->new;
@@ -100,6 +104,18 @@ $ua->agent("WPExport/0.1 ");
 
 # Create MediaWiki::API objects
 my $esobj = MediaWiki::API->new( { api_url => 'http://encoresoup.net/api.php' } );
+
+my $dbname = $opts{db} || 'wpexport.db';
+
+# Connect to local SQLite datacache
+my $dbh = DBI->connect("dbi:SQLite:dbname=$dbname","","");
+
+if ($opts{init}) {
+	init_db();
+}
+
+# Reset 'updated' flags
+$dbh->do("update pages set updated = 0");
 
 unlink "wp.txt";
 unlink "esplus.txt";
@@ -149,6 +165,7 @@ while (my $page = shift @pages) {
 	process_page($page);
 }
 
+$dbh->disconnect();
 exit 0;
 
 sub process_page
@@ -180,11 +197,13 @@ sub process_page
 
 		# Parse the XML.
 		my $estext = parse_export_xml($esxml, "es.txt", 0);
+		store_page($dbh, 'ES', $page, $estext, \%tmplflds);
 
 		# Get Encoresoup Version Templates
 		undef %tmplflds;
 		my $esver = export_page('ES', "Template:Latest_stable_release/$page");
-		parse_export_xml($esver, undef, 2);
+		my $vertext = parse_export_xml($esver, undef, 2);
+		store_page($dbh, 'ES', "Template:Latest_stable_release/$page", $vertext, \%tmplflds);
 
 		if (exists $tmplflds{release_version}) {
 			$es_latest_release_version = $tmplflds{release_version};
@@ -197,7 +216,8 @@ sub process_page
 
 		undef %tmplflds;
 		$esver = export_page('ES', "Template:Latest_preview_release/$page");
-		parse_export_xml($esver, undef, 2);
+		$vertext = parse_export_xml($esver, undef, 2);
+		store_page($dbh, 'ES', "Template:Latest_preview_release/$page", $vertext, \%tmplflds);
 
 		if (exists $tmplflds{release_version}) {
 			$es_latest_preview_version = $tmplflds{release_version};
@@ -230,12 +250,15 @@ sub process_page
 	# Pass in reference to $realpage, gets correct title if we supplied a redirect.
 	my $realpage;
 	my $text = parse_export_xml($wpxml, "wp.txt", $filter, \$realpage);
+	store_page($dbh, 'WP', $realpage, $text, \%tmplflds);
+
 	if (!defined $text) {
 		# undef returned only for images, where 'missing' attributes is set.
 		# - indicates image description is on Wikimedia Commons.
 		print "\tExporting From Wikimedia Commons\n";
 		my $wpxml = export_page('CO', $page);
-		parse_export_xml($wpxml, "wp.txt", $filter);
+		$text = parse_export_xml($wpxml, "wp.txt", $filter, \$realpage);
+		store_page($dbh, 'WP', $realpage, $text, \%tmplflds);
 	}
 
 	if ($page ne $realpage) {
@@ -381,6 +404,8 @@ sub parse_export_xml
 	my $title = "";
 	my $text = "";
 	my $rev = "";
+	my $revid = 0;
+	my $revts = "";
 	my $missing = 0;
 
 	my %pages;
@@ -388,7 +413,12 @@ sub parse_export_xml
 	my $twig = XML::Twig->new(
 	 	twig_handlers =>
 			{ 
-			  'revisions/rev' => sub { $rev = $_->text; },
+			  'revisions/rev' => sub
+					{
+						$rev = $_->text;
+						$revid = $_->atts->{revid};
+						$revts = $_->atts->{timestamp};
+					},
 				'page' => sub
 					{ 
 						# If missing attribute set, then discard this page and return undef.
@@ -416,6 +446,9 @@ sub parse_export_xml
 	}
 
 	$$realpage = $title if defined $realpage && ref $realpage;
+
+	$meta{revid} = $revid;
+	$meta{revts} = $revts;
 
 	return $text;
 }
@@ -568,7 +601,7 @@ sub export_page
 	my $url = ($site eq 'WP') ? $wpapi
 		: ($site eq 'CO') ? $coapi : $esapi;
 
-	my $q = "action=query&prop=revisions&titles=$page&rvlimit=1&rvprop=content&redirects=1&format=xml";
+	my $q = "action=query&prop=revisions&titles=$page&rvlimit=1&rvprop=content|ids|timestamp&redirects=1&format=xml";
 	return do_query($url, $q, $file);
 }
 
@@ -714,7 +747,20 @@ sub create_redirect_text
 EOF
 ;
 
-	close FH
+	close FH;
+
+	$dbh->do(
+	 "insert into redirects
+		(
+		  pages_id,
+			title
+		)
+		select
+			id,
+			'$redir'
+		from pages
+		where title = '$page'"
+	);
 }
 
 sub get_image
@@ -895,3 +941,184 @@ sub parse_allpages_xml
 	return ($cont, @titles);
 }
 
+sub store_page
+{
+	my $dbh = shift;
+	my $site = shift;
+	my $title = shift;
+	my $text = shift;
+	my $tmplflds = shift;
+
+	$dbh->do(
+	 "update pages
+		set text = ?,
+				revid = $meta{revid},
+				revts = '$meta{revts}',
+		    updated = 1
+		where title = ?
+		and revid < $meta{revid}",
+
+		undef,
+		$text, $title
+	);
+
+	$dbh->do(
+	 "insert into pages
+	 	(
+			sites_id,
+			title,
+			text,
+			revid,
+			revts,
+			updated
+		)
+		select
+			id,
+			?,
+			?,
+			$meta{revid},
+			'$meta{revts}',
+			1
+		from sites
+		where name = '$site'
+		and not exists
+		(
+		  select 1
+			from pages
+			where title = ?
+		)",
+
+		undef,
+		$title,
+		$text,
+		$title
+	);
+
+	my $pages_id = $dbh->last_insert_id(undef, undef, undef, undef);
+	my $tname = $tmplflds->{template};
+	$dbh->do(
+	 "insert into templates
+		(
+			pages_id,
+			name
+		)
+		values
+		(
+			$pages_id,
+			'$tname'
+		)"
+	);
+
+	my $templates_id = $dbh->last_insert_id(undef, undef, undef, undef);
+
+	while (my ($key,$val) = each %$tmplflds) {
+		$dbh->do(
+		 "insert into tmplflds
+			(
+				templates_id,
+				field, 
+				value
+			)
+			values
+			(
+				$templates_id,
+				'$key',
+				'$val'
+			)"
+		);
+	}
+}
+
+sub init_db
+{
+	$dbh->do(
+		"CREATE TABLE sites (
+    id INTEGER PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL,
+    url TEXT NOT NULL,
+    file TEXT
+		)"
+	);
+
+	$dbh->do(
+	 "CREATE TABLE pages (
+    id INTEGER PRIMARY KEY NOT NULL,
+    sites_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    text TEXT,
+		revid INTEGER,
+		revts TEXT,
+		updated INTEGER
+		)"
+	);
+
+	$dbh->do(
+	 "CREATE TABLE templates (
+    id INTEGER PRIMARY KEY NOT NULL,
+    pages_id INTEGER NOT NULL,
+    name TEXT NOT NULL
+		)"
+	);
+
+	$dbh->do(
+	 "CREATE TABLE tmplflds (
+    id INTEGER PRIMARY KEY NOT NULL,
+    templates_id INTEGER NOT NULL,
+    field TEXT NOT NULL,
+    value TEXT
+		)"
+	);
+
+	$dbh->do(
+	 "CREATE TABLE redirects (
+    id INTEGER PRIMARY KEY NOT NULL,
+    pages_id INTEGER NOT NULL,
+    title TEXT
+		)"
+	);
+
+	$dbh->do(
+	 "insert into sites
+		(
+			name,
+			url,
+			file
+		)
+		values
+		(
+			'ES',
+			'encoresoup.net',
+			'es.txt'
+		)"
+	);
+
+	$dbh->do(
+	 "insert into sites
+		(
+			name,
+			url,
+			file
+		)
+		values
+		(
+			'WP',
+			'en.wikipedia.org/w',
+			'wp.txt'
+		)"
+	);
+
+	$dbh->do(
+	 "insert into sites
+		(
+			name,
+			url,
+			file
+		)
+		values
+		(
+			'CO',
+			'commons.wikimedia.org/w',
+			null
+		)"
+	);
+}
