@@ -73,7 +73,9 @@ use DBI;
 binmode STDOUT, ':utf8';
 $| = 1;
 
-my %cats;
+# Hashref storing site information.
+my $sites;
+
 my %tmplflds;
 my %meta;
 
@@ -84,7 +86,7 @@ my %opts;
 Getopt::Long::Configure("bundling");
 GetOptions (\%opts,
 	'db=s',
-	'init',
+	'site=s',
   'merge',
 	'imagehash',
 	'getimages',
@@ -93,10 +95,16 @@ GetOptions (\%opts,
 	'keeplinks:s',
 	'redirects',
 	'rebuild-klcache',
-	'allpages'
+	'allpages',
+	'export-updated|export',
+	'export-all',
+	'merge-fixup',
+	'status'
 ) or die("$usage\nInvalid Option\n");
 
-map { $opts{$_} = 0 if !exists($opts{$_}) } qw/merge imagehash getimages redirects rebuild-klcache allpages init/;
+die ("Must specify site!\n") unless defined $opts{site} || defined $opts{status};
+
+map { $opts{$_} = 0 if !exists($opts{$_}) } qw/merge imagehash getimages redirects rebuild-klcache allpages merge-fixup/;
 
 # Create a user agent object
 my $ua = LWP::UserAgent->new;
@@ -110,8 +118,27 @@ my $dbname = $opts{db} || 'wpexport.db';
 # Connect to local SQLite datacache
 my $dbh = DBI->connect("dbi:SQLite:dbname=$dbname","","");
 
-if ($opts{init}) {
-	init_db();
+# Cache 'sites' table into hashref
+$sites = $dbh->selectall_hashref("select * from sites", 'name');
+
+if ($opts{status}) {
+	print_status();
+	exit 0;
+}
+
+if ($opts{'export-updated'}) {
+	export_pages(uc $opts{site}, 0, 1);
+	exit 0;
+}
+
+if ($opts{'export-all'}) {
+	export_pages(uc $opts{site}, 0, 0);
+	exit 0;
+}
+
+if ($opts{'merge-fixup'}) {
+	create_version_templates();
+	exit 0;
 }
 
 # Reset 'updated' flags
@@ -120,6 +147,8 @@ $dbh->do("update pages set updated = 0");
 unlink "wp.txt";
 unlink "esplus.txt";
 unlink "es.txt" if $opts{merge};
+
+my $siteinfo = $dbh->selectrow_hashref("select * from sites where name = '$opts{site}'");
 
 my @pages;
 if ($opts{file}) {
@@ -162,7 +191,7 @@ if (exists $opts{keeplinks}) {
 
 # while loop - allows for additional pages to be pushed onto the end of @pages;
 while (my $page = shift @pages) {
-	process_page($page);
+	process_page($opts{site}, $page);
 }
 
 $dbh->disconnect();
@@ -170,6 +199,7 @@ exit 0;
 
 sub process_page
 {
+	my $site = shift;
 	my $page = shift;
 
 	my $isimage;
@@ -182,83 +212,26 @@ sub process_page
 	print "Processing Page: $page\n";
 
 	$isimage = ($page =~ /^Image:/i) ? 1 : 0;
-	$filter = ($isimage) ? 3 : 1;
 
-	# Get Details from Encoresoup for merging.
-	my $esxml;
-	my $es_latest_release_version = '';
-	my $es_latest_release_date = '';
-	my $es_latest_preview_version = '';
-	my $es_latest_preview_date = '';
-	my $espage = '';
-	if ($opts{merge}) {
-		print "\tExporting From Encoresoup\n";
-		$esxml = export_page('ES', $page);
-
-		# Parse the XML.
-		my $estext = parse_export_xml($esxml, "es.txt", 0);
-		store_page($dbh, 'ES', $page, $estext, \%tmplflds);
-
-		# Get Encoresoup Version Templates
-		undef %tmplflds;
-		my $esver = export_page('ES', "Template:Latest_stable_release/$page");
-		my $vertext = parse_export_xml($esver, undef, 2);
-		store_page($dbh, 'ES', "Template:Latest_stable_release/$page", $vertext, \%tmplflds);
-
-		if (exists $tmplflds{release_version}) {
-			$es_latest_release_version = $tmplflds{release_version};
-			print "\tES: Latest Release Version: $es_latest_release_version\n";
-		}
-		if (exists $tmplflds{release_date}) {
-			$es_latest_release_date = $tmplflds{release_date};
-			print "\tES: Latest Release Date: $es_latest_release_date\n";
-		}
-
-		undef %tmplflds;
-		$esver = export_page('ES', "Template:Latest_preview_release/$page");
-		$vertext = parse_export_xml($esver, undef, 2);
-		store_page($dbh, 'ES', "Template:Latest_preview_release/$page", $vertext, \%tmplflds);
-
-		if (exists $tmplflds{release_version}) {
-			$es_latest_preview_version = $tmplflds{release_version};
-			print "\tES: Latest Preview Version: $es_latest_preview_version\n";
-		}
-		if (exists $tmplflds{release_date}) {
-			$es_latest_preview_date = $tmplflds{release_date};
-			print "\tES: Latest Preview Date: $es_latest_preview_date\n";
-		}
-
-		# Add redirects
-		if ($opts{redirects}) {
-			my @redirs = get_redirects($page,'ES',1);
-			map { create_redirect_text($page, 'ES', $_) } @redirs;
-		}
-
-		# Change page name to retrieve from Wikipedia if {{Wikipedia-Attrib}} template is used.
-		my ($wppage) = $estext =~ /\{\{Wikipedia-Attrib\|(.*?)\}\}/i;
-
-		if ($page ne $wppage) {
-			print "\tPage On Wikipedia: $wppage\n";
-			$espage = $page;
-			$page = $wppage;
-		}
-	}
-
-	print "\tExporting From Wikipedia\n";
-	my $wpxml = export_page('WP', $page);
+	print "\tExporting From " . $siteinfo->{desc} . "\n";
+	my $xml = get_page($site, $page);
 
 	# Pass in reference to $realpage, gets correct title if we supplied a redirect.
 	my $realpage;
-	my $text = parse_export_xml($wpxml, "wp.txt", $filter, \$realpage);
-	store_page($dbh, 'WP', $realpage, $text, \%tmplflds);
-
+	my $text = parse_export_xml($xml, \$realpage);
 	if (!defined $text) {
 		# undef returned only for images, where 'missing' attributes is set.
 		# - indicates image description is on Wikimedia Commons.
 		print "\tExporting From Wikimedia Commons\n";
-		my $wpxml = export_page('CO', $page);
-		$text = parse_export_xml($wpxml, "wp.txt", $filter, \$realpage);
-		store_page($dbh, 'WP', $realpage, $text, \%tmplflds);
+		$site = 'CO';
+		my $xml = get_page($site, $page);
+		$text = parse_export_xml($xml, \$realpage);
+	}
+
+	# No such page!
+	if (!defined $text) {
+		print "\tPage Does Not Exist: $page\n";
+		return;
 	}
 
 	if ($page ne $realpage) {
@@ -266,144 +239,176 @@ sub process_page
 		$page = $realpage;
 	}
 
-	# Extract Versions from WP Page.
-	my $wp_latest_release_version = '';
-	my $wp_latest_release_date = '';
-	my $wp_latest_preview_version = '';
-	my $wp_latest_preview_date = '';
+	my $page_id = store_page($dbh, $site, $page, $text, \%tmplflds);
 
-	if ($tmplflds{frequently_updated} =~ /yes/i) {
+	# page_id will be zero if page already exists and does not need updating.
+	if ($page_id && ($site ne 'ES')) {
+		# Try to locate equivalent page on Encoresoup
+		my $link_page_id = link_matching_page($dbh, $site, $page, $page_id);
+
+		$text = process_text($page, $text, $page_id, $link_page_id);
+		store_revision($dbh, $sites->{$site}{id}, $page_id, 'ESMERGE', $text);
+	}
+
+	# Identify Images
+	if ($opts{getimages}) {
+		my @images = ($text =~ /\[\[(Image:[^\#\|\]]+)/gi);
+		map { s/[^[:ascii:]]+//g; push @pages, $_; } @images;
+	}
+
+	if (($tmplflds{frequently_updated} =~ /yes/i) || ($site eq 'ES')){
 		print "\tNEED TO GET VERSION TEMPLATE!!\n\n";
 
 		undef %tmplflds;
-		my $wpver = export_page('WP', "Template:Latest_stable_release/$page");
-		parse_export_xml($wpver, undef, 2);
-
-		if (exists $tmplflds{latest_release_version}) {
-			$wp_latest_release_version = $tmplflds{latest_release_version};
-			print "\tWP: Latest Release Version: $wp_latest_release_version\n";
-		}
-		if (exists $tmplflds{latest_release_date}) {
-			$wp_latest_release_date = $tmplflds{latest_release_date};
-			print "\tWP: Latest Release Date: $wp_latest_release_date\n";
-		}
+		my $xml = get_page($site, "Template:Latest_stable_release/$page");
+		$text = parse_export_xml($xml, \$realpage);
+		my $ib = extract_bracketed($text, '{}');
+		get_template_fields($ib);
+		store_page($dbh, $site, "Template:Latest_stable_release/$page", $text, \%tmplflds, $page_id)
+			if defined $text;
 
 		undef %tmplflds;
-		$wpver = export_page('WP', "Template:Latest_preview_release/$page");
-		parse_export_xml($wpver, undef, 2);
-
-		if (exists $tmplflds{latest_release_version}) {
-			$wp_latest_preview_version = $tmplflds{latest_release_version};
-			print "\tWP: Latest Preview Version: $wp_latest_preview_version\n";
-		}
-		if (exists $tmplflds{latest_release_date}) {
-			$wp_latest_preview_date = $tmplflds{latest_release_date};
-			print "\tWP: Latest Preview Date: $wp_latest_preview_date\n";
-		}
+		$xml = get_page($site, "Template:Latest_preview_release/$page");
+		$text = parse_export_xml($xml, \$realpage);
+		$ib = extract_bracketed($text, '{}');
+		get_template_fields($ib);
+		store_page($dbh, $site, "Template:Latest_preview_release/$page", $text, \%tmplflds, $page_id)
+			if defined $text;
 	}
-	else {
-		if (exists $tmplflds{latest_release_version}) {
-			$wp_latest_release_version = $tmplflds{latest_release_version};
-			print "\tWP: Latest Release Version: $wp_latest_release_version\n";
-		}
-		if (exists $tmplflds{latest_release_date}) {
-			$wp_latest_release_date = $tmplflds{latest_release_date};
-			print "\tWP: Latest Release Date: $wp_latest_release_date\n";
-		}
-		if (exists $tmplflds{latest_preview_version}) {
-			$wp_latest_preview_version = $tmplflds{latest_preview_version};
-			print "\tWP: Latest Preview Version: $wp_latest_preview_version\n";
-		}
-		if (exists $tmplflds{latest_preview_date}) {
-			$wp_latest_preview_date = $tmplflds{latest_preview_date};
-			print "\tWP: Latest Preview Date: $wp_latest_preview_date\n";
-		}
-	}
-
-	# Create Release templates for versions if they exist on WP and are different to on ES (always true if ES
-	# versions not retrieved)
-	if (($wp_latest_release_version && ($es_latest_release_version ne $wp_latest_release_version))
-			|| ($wp_latest_release_date && ($es_latest_release_date ne $wp_latest_release_date))) {
-		print "\tEncoresoup Latest Release is Out Of Date!!\n";
-		create_release_template($page, 'Latest_stable_release', $wp_latest_release_version, $wp_latest_release_date);
-	}
-	if (($wp_latest_preview_version && ($es_latest_preview_version ne $wp_latest_preview_version))
-			|| ($wp_latest_preview_date && ($es_latest_preview_date ne $wp_latest_preview_date))) {
-		print "\tEncoresoup Latest Preview is Out Of Date!!\n";
-		create_release_template($page, 'Latest_preview_release', $wp_latest_preview_version, $wp_latest_preview_date);
-	}
-
-	my $image_src;
 
 	# If we are getting a Image: page, then go get the corresponding image file
+	my $image_src;
 	$image_src = get_image($page) if ($isimage);
 
 	# Do Wikipedia Revision Info Export
-	if (!$isimage || $image_src ne 'F') {
-		get_contributors($page, $image_src);
-	}
+	get_contributors($site, $page, $page_id);
 
 	# Add redirects
 	if ($opts{redirects}) {
 		print "\tCreating Redirect Pages\n";
-		my @redirs = get_redirects($page,'WP',1);
-		# Redirect should point to page on Encoresoup, if different to Wikipedia Title.
-		map { create_redirect_text(($espage) ? $espage : $page, 'WP', $_) } @redirs;
+		my @redirs = get_redirects($page,$site,1);
+		map { create_redirect_text($page, $site, $_) } @redirs;
+	}
+}
+
+sub create_version_templates
+{
+	my ($title, $site, $latest_preview_date, $latest_preview_version);
+
+	my $sth = $dbh->prepare(
+	 "select d.title, e.name, b.value, c.value
+		from templates a
+		  inner join tmplflds b
+			  on a.id = b.template_id
+		  inner join tmplflds c
+				on a.id = c.template_id
+		  inner join pages d
+		    on d.id = a.page_id
+			inner join sites e
+				on e.id = d.site_id
+		where a.name in ('Infobox Software','Infobox_Software')
+		and b.field = 'latest_preview_date'
+		and c.field = 'latest_preview_version'
+		and not exists
+		(
+			select 1
+			from pages f
+			where f.title = 'Template:Latest_preview_release/' || d.title
+			and f.site_id = d.site_id
+		)"
+	);
+
+	$sth->execute;
+
+	my @row;
+	while (@row = $sth->fetchrow_array) {
+		my ($title, $site, $latest_preview_date, $latest_preview_version) = @row;
+		
+		my %tmplflds = (
+			article => $title,
+			release_type => 'Latest_preview_release',
+			release_version => $latest_preview_version,
+			release_date => $latest_preview_date
+		);
+
+		my $text = <<EOF
+{{-start-}}\n'''$title'''
+<!-- Please note: This template is auto-generated, so don't change anything except the version and date! -->
+{{Release
+|article = $title
+|release_type=Latest_preview_release
+|release_version = $latest_preview_version
+|release_date = $latest_preview_date
+}}
+<noinclude>
+Back to article "'''[[$title]]'''"
+</noinclude>
+{{-stop-}}
+EOF
+;
+		my $page = "Template:Latest_preview_release/$title";
+		print "\tCreating Page: $page\n";
+		$meta{revid} = 0;
+		$meta{revts} = '';
+		store_page($dbh, $site, $page, $text, \%tmplflds);
 	}
 }
 
 sub get_contributors
 {
+	my $site = shift;
 	my $page = shift;
-	my $image_src = shift;
+	my $page_id = shift;
 
-	print "\tExporting Contributors from Wikipedia...\n";
+	my $contrib_page = $page;
+	$contrib_page =~ s/:/_/g;
+	$contrib_page = "Template:WPContrib/$contrib_page";
 
-	my $file = 'esplus.txt';
+	my $text;
 
-	open FH, ">>:utf8", $file;
+	print "\tExporting Contributors from " . $sites->{$site}{desc} . "...\n";
 
-	my %contribs;
+	if ($site eq 'ES') {
+		my $xml = get_page($site, $contrib_page);
+		$text = parse_export_xml($xml);
+	}
+	else {
+		my %contribs;
 
-	# Get details from Wikimedia commons if we just got an image from there.
-	my $wpapi;
-	$wpapi = ($image_src eq 'CO') ? "http://commons.wikimedia.org/w/api.php"
-				 : "http://en.wikipedia.org/w/api.php";
-	my $q = "action=query&prop=revisions&titles=$page&rvlimit=max&rvprop=user&format=xml";
-	my $xml = do_query($wpapi, $q);
-	my $revstartid = parse_rev_xml($xml, \%contribs);
-	while($revstartid != 0) {
-		$xml = do_query($wpapi, $q . '&rvstartid=' . $revstartid);
-		$revstartid = parse_rev_xml($xml, \%contribs);
+		# Get details from Wikimedia commons if we just got an image from there.
+		my $url = "http://" . $sites->{$site}{url} . "/api.php";
+		my $q = "action=query&prop=revisions&titles=$page&rvlimit=max&rvprop=user&format=xml";
+		my $xml = do_query($url, $q);
+		my $revstartid = parse_rev_xml($xml, \%contribs);
+		while($revstartid != 0) {
+			$xml = do_query($url, $q . '&rvstartid=' . $revstartid);
+			$revstartid = parse_rev_xml($xml, \%contribs);
+		}
+
+		my $linkpage = $page;
+		$linkpage = ':' . $page if $page =~ /^Image:/i;
+
+		$text = <<EOF
+== $page - Wikipedia Contributors ==
+''The following people have contributed to the [[$linkpage]] article on Wikipedia, prior to it being imported into Encoresoup''
+<div class=\"references-small\" style=\"-moz-column-count:3; -webkit-column-count:3; column-count:3;\">
+EOF
+;
+
+		$text .= '*' . join("\n*", map { (/^[\d\.]*$/) ? "[[w:Special:Contributions/$_|$_]]" : "[[w:User:$_|$_]]" } sort(keys(%contribs)));
+		$text .= "\n</div>\n";
 	}
 
-	my $normpage = $page;
-	$normpage =~ s/:/_/g;
-
-	my $linkpage = $page;
-	$linkpage = ':' . $page if $page =~ /^Image:/i;
-
-	print FH "{{-start-}}\n'''Template:WPContrib/$normpage'''\n";
-	print FH "== $page - Wikipedia Contributors ==\n\n";
-	print FH "''The following people have contributed to the [[$linkpage]] article on Wikipedia, prior to it being imported into Encoresoup''\n\n";
-	print FH "<div class=\"references-small\" style=\"-moz-column-count:3; -webkit-column-count:3; column-count:3;\">\n";
-	print FH '*' . join("\n*", map { (/^[\d\.]*$/) ? "[[w:Special:Contributions/$_|$_]]" : "[[w:User:$_|$_]]" } sort(keys(%contribs)));
-	print FH "\n</div>\n";
-	print FH "{{-stop-}}\n";
-
-	close FH;
+	store_page($dbh, $site, $contrib_page, $text, undef, $page_id);
 }
 
 sub parse_export_xml
 {
 	my $xml = shift;
-	my $file = shift;
-	my $filter = shift;
 	my $realpage = shift; # Must be a reference;
 
 	my $title = "";
 	my $text = "";
-	my $rev = "";
 	my $revid = 0;
 	my $revts = "";
 	my $missing = 0;
@@ -415,7 +420,7 @@ sub parse_export_xml
 			{ 
 			  'revisions/rev' => sub
 					{
-						$rev = $_->text;
+						$text = $_->text;
 						$revid = $_->atts->{revid};
 						$revts = $_->atts->{timestamp};
 					},
@@ -428,9 +433,6 @@ sub parse_export_xml
 						}
 					
 						$title = $_->att('title');
-					  $text .= "{{-start-}}\n'''" . $title . "'''\n";
-						$pages{$title}[$filter] = process_text($title, $rev, $filter);
-						$text .= $pages{$title}[$filter] . "\n{{-stop-}}\n";
 					}
 			},
 		pretty_print => 'indented'
@@ -438,12 +440,6 @@ sub parse_export_xml
 	$twig->parse($xml);
 
 	return undef if $missing;
-
-	if ($file) {
-		open(FH, ">>:utf8", $file);
-		print FH $text;
-		close FH;
-	}
 
 	$$realpage = $title if defined $realpage && ref $realpage;
 
@@ -500,9 +496,24 @@ sub process_text
 {
 	my $title = shift;
   my $text = shift;
-	my $filter = shift;
+  my $link_page_id = shift;
 
-	if ($filter == 1) {
+	my $isimage = ($title =~ /^Image:/i) ? 1 : 0;
+
+	if ($isimage) {
+		# Unlink Wiki-links
+		$text =~ s/\[\[[^\]:]*?\|(.*?)\]\]/\1/g;
+		$text =~ s/\[\[([^\]:]*?)\]\]/\1/g;
+
+		# Comment-out Categories
+		$text =~ s/(\[\[Category:[^\]]*\]\])/<!-- \1 -->/gi;
+
+		# Add Wikipedia-Attrib-Image template if it doesn't already exist
+		my $image = $title;
+		$image =~ s/^Image://i;
+		$text .= "\n{{Wikipedia-Attrib-Image|$image}}" unless $text =~ /\{\{Wikipedia-Attrib-Image/i;
+	}
+	else {
 		# Processing Wikipedia Extract ...
 
 		# Unlink Wiki-links
@@ -522,23 +533,26 @@ sub process_text
 		# Fix Stub templates
 		$text =~ s/\{\{[^\}]*stub\}\}/{{stub}}/gi;
 
+		my $catsref = $dbh->selectall_arrayref(
+		 "select name
+			from categories
+			where page_id = $link_page_id"
+		);
+
+		my @cats = map { '[Category:' . $_->[0] . ']' } @$catsref;
+		my $catstr = join("\n", @cats);
+				
 		# Replace Categories with marker
 		$text =~ s/\[\[Category:[^\]]*\]\]/\%marker\%/gi;
 
 		# Replace first Marker with Encoresoup Categories
-		$text =~ s/\%marker\%/$cats{$title}/;
+		$text =~ s/\%marker\%/$catstr/;
 		
 		# Remove other markers
 		$text =~ s/\%marker\%//g;
 
 		# Comment out language links
 		$text =~ s/\[\[([a-z][a-z]|ast|simple):([^\]]*)\]\]/<!--[[$1:$2]]-->/gi;
-
-		# Identify Images
-		if ($opts{getimages}) {
-			my @images = ($text =~ /\[\[(Image:[^\#\|\]]+)/gi);
-			map { s/[^[:ascii:]]+//g; push @pages, $_; } @images;
-		}
 
 		# Remove templates not used on Encoresoup
 		$text =~ s/\{\{notability[^\}]*\}\}//gi;
@@ -560,56 +574,25 @@ sub process_text
 
 		get_infobox_fields($text);
 	}
-	elsif ($filter == 0) {
-		# Processing Encoresoup Extract (must be done first!) ...
-
-		# Extract Categories
-		my @cats = $text =~ /(\[\[Category:[^\]]*\]\])/ig;
-		$cats{$title} = join("\n", @cats);
-	}
-	elsif ($filter == 2) {
-		my $ib = extract_bracketed($text, '{}');
-		get_template_fields($ib);
-	}
-	elsif ($filter == 3) {
-		# Unlink Wiki-links
-		$text =~ s/\[\[[^\]:]*?\|(.*?)\]\]/\1/g;
-		$text =~ s/\[\[([^\]:]*?)\]\]/\1/g;
-
-		# Comment-out Categories
-		$text =~ s/(\[\[Category:[^\]]*\]\])/<!-- \1 -->/gi;
-
-		# Add Wikipedia-Attrib-Image template if it doesn't already exist
-		my $image = $title;
-		$image =~ s/^Image://i;
-		$text .= "\n{{Wikipedia-Attrib-Image|$image}}" unless $text =~ /\{\{Wikipedia-Attrib-Image/i;
-	}
 
 	return $text;
 }
 
-sub export_page
+sub get_page
 {
 	my $site = shift;
 	my $page = shift;
-	my $file = shift;
 
-	my $wpapi = "http://en.wikipedia.org/w/api.php";
-	my $esapi = "http://encoresoup.net/api.php";
-	my $coapi = "http://commons.wikimedia.org/w/api.php";
-
-	my $url = ($site eq 'WP') ? $wpapi
-		: ($site eq 'CO') ? $coapi : $esapi;
+	my $url = "http://" . $sites->{$site}{url} . "/api.php";
 
 	my $q = "action=query&prop=revisions&titles=$page&rvlimit=1&rvprop=content|ids|timestamp&redirects=1&format=xml";
-	return do_query($url, $q, $file);
+	return do_query($url, $q);
 }
 
 sub do_query
 {
 	my $url = shift;
 	my $q = shift;
-	my $file = shift;
 
 	my $req = HTTP::Request->new(POST => $url);
 	$req->content_type('application/x-www-form-urlencoded');
@@ -621,14 +604,7 @@ sub do_query
 	if ($res->is_success) {
 		my $xml = $res->content;
 		$xml =~ s/^\s*//;
-		if (defined $file) {
-			open FH, '>:utf8', $file;
-			print FH $xml;
-			close FH;
-		}
-		else {
-			return $xml;
-		}
+		return $xml;
 	}
 	else {
 		 print STDERR $res->status_line, "\n";
@@ -735,28 +711,24 @@ sub create_redirect_text
 	my $site = shift;
 	my $redir = shift;
 
-	my $file = ($site eq 'WP') ? 'wp.txt' : 'es.txt';
-
-	open FH, ">>:utf8", $file;
-
-	print FH <<EOF
-{{-start-}}
-'''$redir'''
+	#print FH <<EOF
+#{{-start-}}
+#'''$redir'''
 #REDIRECT [[$page]]
-{{-stop-}}
-EOF
-;
-
-	close FH;
+#{{-stop-}}
+#EOF
+#;
 
 	$dbh->do(
 	 "insert into redirects
 		(
-		  pages_id,
+		  page_id,
+			site_id,
 			title
 		)
 		select
 			id,
+			site_id,
 			'$redir'
 		from pages
 		where title = '$page'"
@@ -948,177 +920,331 @@ sub store_page
 	my $title = shift;
 	my $text = shift;
 	my $tmplflds = shift;
+	my $parent_page = shift;
 
-	$dbh->do(
-	 "update pages
-		set text = ?,
-				revid = $meta{revid},
-				revts = '$meta{revts}',
-		    updated = 1
-		where title = ?
-		and revid < $meta{revid}",
+	my $site_id;
+	my $page_id;
+	my $revision_id;
+	my $text_id;
+	my $template_id;
 
-		undef,
-		$text, $title
+	$site_id = $sites->{$site}{id};
+	die "Unknown site: '$site'\n" if !defined $site_id;
+
+	# Check to see if the page already exists, if it does has it been updated?
+	my $page_id = 0;
+	my $last_revid = 0;
+	($page_id, $last_revid) = $dbh->selectrow_array(
+	 "select page_id, revid
+		from pages a
+		  inner join revisions b
+			  on a.id = b.page_id
+		where a.title = ?
+		and a.site_id = $site_id
+		and b.action = 'ORIG'"
 	);
+
+	# If page already in datacache and has not been updated, then just return.
+	return 0 if defined $last_revid && ($last_revid == $meta{revid});
+
+	# If newer version exists, delete the old details
+	if ($page_id) {
+		$dbh->do("delete from pages where page_id = $page_id");
+		$dbh->do("delete from revisions where page_id = $page_id");
+		$dbh->do("delete from text where page_id = $page_id");
+		$dbh->do("delete from templates where page_id = $page_id");
+		$dbh->do("delete from tmplflds where page_id = $page_id");
+		$dbh->do("delete from categories where page_id = $page_id");
+		$dbh->do("delete from pagelinks where page_id_parent = $page_id");
+		$dbh->do("delete from pagelinks where page_id_child = $page_id");
+	}
 
 	$dbh->do(
 	 "insert into pages
 	 	(
-			sites_id,
+			site_id,
 			title,
-			text,
-			revid,
-			revts,
 			updated
 		)
-		select
-			id,
-			?,
-			?,
-			$meta{revid},
-			'$meta{revts}',
-			1
-		from sites
-		where name = '$site'
-		and not exists
+		values
 		(
-		  select 1
-			from pages
-			where title = ?
+			$site_id,
+			?,
+			1
 		)",
 
 		undef,
 		$title,
-		$text,
-		$title
 	);
 
-	my $pages_id = $dbh->last_insert_id(undef, undef, undef, undef);
-	my $tname = $tmplflds->{template};
-	$dbh->do(
-	 "insert into templates
-		(
-			pages_id,
-			name
-		)
-		values
-		(
-			$pages_id,
-			'$tname'
-		)"
-	);
+	$page_id = $dbh->last_insert_id(undef, undef, undef, undef);
 
-	my $templates_id = $dbh->last_insert_id(undef, undef, undef, undef);
+	my $revision_id = store_revision($dbh, $site_id, $page_id, 'ORIG', $text);
 
-	while (my ($key,$val) = each %$tmplflds) {
+	if (defined $tmplflds) {
+		my $tname = $tmplflds->{template};
 		$dbh->do(
-		 "insert into tmplflds
+		 "insert into templates
 			(
-				templates_id,
-				field, 
-				value
+				page_id,
+				site_id,
+				name
 			)
 			values
 			(
-				$templates_id,
-				'$key',
-				'$val'
+				$page_id,
+				$site_id,
+				'$tname'
+			)"
+		);
+
+		my $template_id = $dbh->last_insert_id(undef, undef, undef, undef);
+
+		while (my ($key,$val) = each %$tmplflds) {
+			$dbh->do(
+			 "insert or replace into tmplflds
+				(
+					template_id,
+					page_id,
+					site_id,
+					field, 
+					value
+				)
+				values
+				(
+					$template_id,
+					$page_id,
+					$site_id,
+					'$key',
+					'$val'
+				)"
+			);
+		}
+	}
+
+	my @cats = $text =~ /(\[\[Category:[^\]]*\]\])/ig;
+	for my $cat (@cats) {
+		$dbh->do(
+		 "insert into categories
+			(
+				revision_id,
+				page_id,
+				site_id,
+				name
+			)
+			values
+			(
+				$revision_id,
+				$page_id,
+				$site_id,
+				'$cat'
 			)"
 		);
 	}
+
+	if (defined $parent_page) {
+		$dbh->do(
+		 "insert into pagelinks
+			(
+				site_id_parent,
+				page_id_parent,
+				site_id_child,
+				page_id_child
+			)
+			values
+			(
+				$site_id,
+				$parent_page,
+				$site_id,
+				$page_id
+			)"
+		);
+	}
+
+	return $page_id;
 }
 
-sub init_db
+sub store_revision
 {
+	my $dbh = shift;
+	my $site_id = shift;
+	my $page_id = shift;
+	my $action = shift;
+	my $text = shift;
+	
 	$dbh->do(
-		"CREATE TABLE sites (
-    id INTEGER PRIMARY KEY NOT NULL,
-    name TEXT NOT NULL,
-    url TEXT NOT NULL,
-    file TEXT
+	 "insert into revisions
+	 	(
+			page_id,
+			site_id,
+			revid,
+			revts,
+			action,
+			updated
+		)
+		values (
+			$page_id,
+			$site_id,
+			$meta{revid},
+			'$meta{revts}',
+			'$action',
+			1
 		)"
 	);
 
-	$dbh->do(
-	 "CREATE TABLE pages (
-    id INTEGER PRIMARY KEY NOT NULL,
-    sites_id INTEGER NOT NULL,
-    title TEXT NOT NULL,
-    text TEXT,
-		revid INTEGER,
-		revts TEXT,
-		updated INTEGER
-		)"
-	);
+	my $revision_id = $dbh->last_insert_id(undef, undef, undef, undef);
 
 	$dbh->do(
-	 "CREATE TABLE templates (
-    id INTEGER PRIMARY KEY NOT NULL,
-    pages_id INTEGER NOT NULL,
-    name TEXT NOT NULL
-		)"
-	);
-
-	$dbh->do(
-	 "CREATE TABLE tmplflds (
-    id INTEGER PRIMARY KEY NOT NULL,
-    templates_id INTEGER NOT NULL,
-    field TEXT NOT NULL,
-    value TEXT
-		)"
-	);
-
-	$dbh->do(
-	 "CREATE TABLE redirects (
-    id INTEGER PRIMARY KEY NOT NULL,
-    pages_id INTEGER NOT NULL,
-    title TEXT
-		)"
-	);
-
-	$dbh->do(
-	 "insert into sites
+	 "insert into text
 		(
-			name,
-			url,
-			file
+			revision_id,
+			page_id,
+			site_id,
+			text
 		)
 		values
 		(
-			'ES',
-			'encoresoup.net',
-			'es.txt'
-		)"
+			$revision_id,
+			$page_id,
+			$site_id,
+			?
+		)",
+
+		undef,
+		$text
 	);
 
 	$dbh->do(
-	 "insert into sites
-		(
-			name,
-			url,
-			file
-		)
-		values
-		(
-			'WP',
-			'en.wikipedia.org/w',
-			'wp.txt'
-		)"
+	 "update pages
+		set latest_action = '$action'
+		where id = $page_id"
 	);
 
+	return $revision_id;
+}
+
+sub export_pages
+{
+	my $site = shift;
+	my $parent = shift;
+	my $updated = shift;
+	my $level = shift || 0;
+
+	unlink $sites->{$site}{file} if !$parent;
+
+	my $updsql = ($updated) ? "and a.updated = 1" : "";
+	my $parsql = ($parent) ?  "and l.page_id_parent = $parent" : "and l.page_id_parent is null";
+
+	my $sth = $dbh->prepare(
+	 "select a.id, a.title, d.text
+		from pages a
+		  inner join sites b
+			  on a.site_id = b.id
+			inner join revisions c
+				on a.id = c.page_id
+			inner join text d
+			  on c.id = d.revision_id
+			left join pagelinks l
+				on a.id = l.page_id_child
+				and a.site_id = l.site_id_child
+				and a.site_id = l.site_id_parent
+		where b.name = '$site'
+		and c.action = a.latest_action
+		$parsql
+		$updsql
+		order by title"
+	);
+
+	$sth->execute();
+
+	open FH, ">>:utf8", $sites->{$site}{file};
+
+	my ($page_id, $title, $text);
+	while (($page_id, $title, $text) = $sth->fetchrow_array) {
+		print ("\t" x $level . "Exporting $title...\n");
+
+		print FH "{{-start-}}\n";
+		print FH "'''$title'''\n";
+		print FH $text, "\n";
+		print FH "{{-stop-}}\n";
+
+		export_pages($site, $page_id, $updated, $level+1);
+	}
+
+	close FH;
+}
+
+sub link_matching_page
+{
+	my $dbh = shift;
+	my $site = shift;
+	my $page = shift;
+	my $page_id = shift;
+
+	my $site_id = $sites->{$site}{id};
+	my $es_site_id = $sites->{ES}{id};
+
+	my $link_page_id = 0;
+
+	# First check if there is already a link!
+	($link_page_id) = $dbh->selectrow_array(
+	 "select page_id_parent
+	  from pagelinks
+		where site_id_parent = $site_id
+		and page_id_parent = $page_id
+		and site_id_child = $es_site_id"
+	);
+
+	return if $link_page_id;
+
+	($link_page_id) = $dbh->selectrow_array(
+	 "select id
+	  from pages
+		where title = '$page'
+		and site_id = $es_site_id"
+	);
+
+	if (!$link_page_id) {
+		# There might be a redirect with the matching title
+		($link_page_id) = $dbh->selectrow_array(
+		 "select page_id
+			from redirects
+			where title = '$page'
+			and site_id = $es_site_id"
+		);
+	}
+
+	return unless $link_page_id;
+
+	# Link the pages together
 	$dbh->do(
-	 "insert into sites
-		(
-			name,
-			url,
-			file
+	 "insert into pagelinks
+	  (
+			site_id_parent,
+		  page_id_parent,
+			site_id_child,
+			page_id_child
 		)
-		values
-		(
-			'CO',
-			'commons.wikimedia.org/w',
-			null
-		)"
+		select 
+			$site_id,
+			$page_id,
+			$es_site_id,
+			$link_page_id"
 	);
 }
+
+sub print_status
+{
+	my $status = $dbh->selectall_arrayref(
+	 "select s.name, count(*)
+		from pages p
+			inner join sites s
+				on p.site_id = s.id
+		group by s.name"
+	);
+
+	for my $site (@$status) {
+		print $site->[0], "\t", $site->[1], "\n";
+	}
+}
+
