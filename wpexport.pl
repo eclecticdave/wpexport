@@ -201,6 +201,7 @@ sub process_page
 {
 	my $site = shift;
 	my $page = shift;
+	my $parent_page_id = shift;
 
 	my $isimage;
 	my $filter;
@@ -239,21 +240,22 @@ sub process_page
 		$page = $realpage;
 	}
 
-	my $page_id = store_page($dbh, $site, $page, $text, \%tmplflds);
+	my $page_id = store_page($dbh, $site, $page, $text, \%tmplflds, $parent_page_id);
 
 	# page_id will be zero if page already exists and does not need updating.
 	if ($page_id && ($site ne 'ES')) {
 		# Try to locate equivalent page on Encoresoup
 		my $link_page_id = link_matching_page($dbh, $site, $page, $page_id);
+		print "\tPage Linked to $page (id = $page_id) is id $link_page_id\n";
 
-		$text = process_text($page, $text, $page_id, $link_page_id);
+		$text = process_text($page, $text, $link_page_id);
 		store_revision($dbh, $sites->{$site}{id}, $page_id, 'ESMERGE', $text);
 	}
 
 	# Identify Images
 	if ($opts{getimages}) {
 		my @images = ($text =~ /\[\[(Image:[^\#\|\]]+)/gi);
-		map { s/[^[:ascii:]]+//g; push @pages, $_; } @images;
+		map { s/[^[:ascii:]]+//g; process_page($site, $_, $page_id); } @images;
 	}
 
 	if (($tmplflds{frequently_updated} =~ /yes/i) || ($site eq 'ES')){
@@ -498,6 +500,8 @@ sub process_text
   my $text = shift;
   my $link_page_id = shift;
 
+	my $es_site_id = $sites->{ES}{id};
+
 	my $isimage = ($title =~ /^Image:/i) ? 1 : 0;
 
 	if ($isimage) {
@@ -533,13 +537,15 @@ sub process_text
 		# Fix Stub templates
 		$text =~ s/\{\{[^\}]*stub\}\}/{{stub}}/gi;
 
+		print "\tGetting Encoresoup Categories (page_id = $link_page_id)\n";
 		my $catsref = $dbh->selectall_arrayref(
 		 "select name
 			from categories
-			where page_id = $link_page_id"
+			where page_id = $link_page_id
+			and site_id = $es_site_id"
 		);
 
-		my @cats = map { '[Category:' . $_->[0] . ']' } @$catsref;
+		my @cats = map { '[[Category:' . $_->[0] . ']]' } @$catsref;
 		my $catstr = join("\n", @cats);
 				
 		# Replace Categories with marker
@@ -1024,6 +1030,8 @@ sub store_page
 
 	my @cats = $text =~ /(\[\[Category:[^\]]*\]\])/ig;
 	for my $cat (@cats) {
+		$cat =~ s/\[\[Category:([^\]]*)\]\]/\1/i;
+
 		$dbh->do(
 		 "insert into categories
 			(
@@ -1231,6 +1239,8 @@ sub link_matching_page
 			$es_site_id,
 			$link_page_id"
 	);
+
+	return $link_page_id;
 }
 
 sub print_status
