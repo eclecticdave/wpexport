@@ -99,12 +99,13 @@ GetOptions (\%opts,
 	'export-updated|export',
 	'export-all',
 	'merge-fixup',
-	'status'
+	'status',
+	'delete'
 ) or die("$usage\nInvalid Option\n");
 
 die ("Must specify site!\n") unless defined $opts{site} || defined $opts{status};
 
-map { $opts{$_} = 0 if !exists($opts{$_}) } qw/merge imagehash getimages redirects rebuild-klcache allpages merge-fixup/;
+map { $opts{$_} = 0 if !exists($opts{$_}) } qw/merge imagehash getimages redirects rebuild-klcache allpages merge-fixup delete status/;
 
 # Create a user agent object
 my $ua = LWP::UserAgent->new;
@@ -140,9 +141,6 @@ if ($opts{'merge-fixup'}) {
 	create_version_templates();
 	exit 0;
 }
-
-# Reset 'updated' flags
-$dbh->do("update pages set updated = 0");
 
 unlink "wp.txt";
 unlink "esplus.txt";
@@ -188,6 +186,16 @@ if (exists $opts{keeplinks}) {
 		}
 	}
 }
+
+if ($opts{delete}) {
+	while (my $page = shift @pages) {
+		delete_page($opts{site}, $page);
+	}
+	exit 0;
+}
+
+# Reset 'updated' flags
+$dbh->do("update pages set updated = 0");
 
 # while loop - allows for additional pages to be pushed onto the end of @pages;
 while (my $page = shift @pages) {
@@ -259,7 +267,7 @@ sub process_page
 	}
 
 	if (($tmplflds{frequently_updated} =~ /yes/i) || ($site eq 'ES')){
-		print "\tNEED TO GET VERSION TEMPLATE!!\n\n";
+		print "\tNEED TO GET VERSION TEMPLATE!!\n\n" unless $site eq 'ES';
 
 		undef %tmplflds;
 		my $xml = get_page($site, "Template:Latest_stable_release/$page");
@@ -280,7 +288,7 @@ sub process_page
 
 	# If we are getting a Image: page, then go get the corresponding image file
 	my $image_src;
-	$image_src = get_image($page) if ($isimage);
+	$image_src = get_image($page) if ($isimage && $page_id);
 
 	# Do Wikipedia Revision Info Export
 	get_contributors($site, $page, $page_id);
@@ -726,18 +734,21 @@ sub create_redirect_text
 #;
 
 	$dbh->do(
-	 "insert into redirects
+	 "insert or replace into redirects
 		(
 		  page_id,
 			site_id,
 			title
 		)
 		select
-			id,
-			site_id,
+			a.id,
+			a.site_id,
 			'$redir'
-		from pages
-		where title = '$page'"
+		from pages a
+		  inner join sites b
+			  on a.site_id = b.id
+		where a.title = '$page'
+		and b.name = '$site'"
 	);
 }
 
@@ -928,13 +939,11 @@ sub store_page
 	my $tmplflds = shift;
 	my $parent_page = shift;
 
-	my $site_id;
-	my $page_id;
 	my $revision_id;
 	my $text_id;
 	my $template_id;
 
-	$site_id = $sites->{$site}{id};
+	my $site_id = $sites->{$site}{id};
 	die "Unknown site: '$site'\n" if !defined $site_id;
 
 	# Check to see if the page already exists, if it does has it been updated?
@@ -947,11 +956,17 @@ sub store_page
 			  on a.id = b.page_id
 		where a.title = ?
 		and a.site_id = $site_id
-		and b.action = 'ORIG'"
+		and b.action = 'ORIG'",
+
+		undef,
+		$title
 	);
 
 	# If page already in datacache and has not been updated, then just return.
-	return 0 if defined $last_revid && ($last_revid == $meta{revid});
+	if (defined $last_revid && ($last_revid == $meta{revid})) {
+		print "\tPage '$title' is already up to date!\n";
+		return 0;
+	}
 
 	# If newer version exists, delete the old details
 	if ($page_id) {
@@ -1141,7 +1156,9 @@ sub export_pages
 	unlink $sites->{$site}{file} if !$parent;
 
 	my $updsql = ($updated) ? "and a.updated = 1" : "";
-	my $parsql = ($parent) ?  "and l.page_id_parent = $parent" : "and l.page_id_parent is null";
+	my $parsql = ($parent) ?
+		"and l.page_id_parent = $parent" :
+		"and b.name = '$site' and l.page_id_parent is null";
 
 	my $sth = $dbh->prepare(
 	 "select a.id, a.title, d.text
@@ -1156,8 +1173,7 @@ sub export_pages
 				on a.id = l.page_id_child
 				and a.site_id = l.site_id_child
 				and a.site_id = l.site_id_parent
-		where b.name = '$site'
-		and c.action = a.latest_action
+		where c.action = a.latest_action
 		$parsql
 		$updsql
 		order by title"
@@ -1165,21 +1181,21 @@ sub export_pages
 
 	$sth->execute();
 
-	open FH, ">>:utf8", $sites->{$site}{file};
-
 	my ($page_id, $title, $text);
 	while (($page_id, $title, $text) = $sth->fetchrow_array) {
 		print ("\t" x $level . "Exporting $title...\n");
+
+		open FH, ">>:utf8", $sites->{$site}{file};
 
 		print FH "{{-start-}}\n";
 		print FH "'''$title'''\n";
 		print FH $text, "\n";
 		print FH "{{-stop-}}\n";
 
+		close FH;
+
 		export_pages($site, $page_id, $updated, $level+1);
 	}
-
-	close FH;
 }
 
 sub link_matching_page
@@ -1258,3 +1274,43 @@ sub print_status
 	}
 }
 
+sub delete_page
+{
+	my $site = shift;
+	my $title = shift;
+
+	my $site_id;
+	my $page_id;
+
+	$site_id = $sites->{$site}{id};
+	die "Unknown site: '$site'\n" if !defined $site_id;
+
+	print "DELETING Page: $title\n";
+	my $page_id = 0;
+	($page_id) = $dbh->selectrow_array(
+	 "select id
+		from pages
+		where title = ?
+		and site_id = $site_id",
+
+		undef,
+		$title
+	);
+
+	if (!$page_id) {
+		print "\tNo such page!\n";
+		return 0;
+	}
+
+	$dbh->do("delete from pages where id = $page_id");
+	$dbh->do("delete from revisions where page_id = $page_id");
+	$dbh->do("delete from text where page_id = $page_id");
+	$dbh->do("delete from templates where page_id = $page_id");
+	$dbh->do("delete from tmplflds where page_id = $page_id");
+	$dbh->do("delete from categories where page_id = $page_id");
+	$dbh->do("delete from pagelinks where page_id_parent = $page_id");
+	$dbh->do("delete from pagelinks where page_id_child = $page_id");
+
+	print "\tPage DELETED!\n";
+}
+	
