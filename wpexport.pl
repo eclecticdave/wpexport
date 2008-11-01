@@ -30,11 +30,6 @@
 #     wp.txt       Main output file containing main page text.
 #     es.txt       Matching page text from Encoresoup (only created if --merge option is used)
 #                     These two files can then be merged using e.g. kdiff3.
-#     esplus.txt   Supporting pages -
-#                      List of Wikipedia contributors goes in page Template:WPContrib/<page title>
-#                      Release version templates where applicable go in page
-#                         Template:Latest_stable_release/<page title> and
-#                         Template:Latest_preview_release/<page title>
 #                      
 #
 # Copyright (C) 2008 David Claughton <dave@encoresoup.net>
@@ -69,6 +64,7 @@ use MD5;
 use Term::ProgressBar;
 use MediaWiki::API;
 use DBI;
+use URI::Escape;
 
 binmode STDOUT, ':utf8';
 $| = 1;
@@ -77,7 +73,7 @@ $| = 1;
 my $sites;
 
 my %tmplflds;
-my %meta;
+#my %meta;
 
 my $script=basename($0);
 my $usage="Usage: $script [--<opts>]";
@@ -100,12 +96,13 @@ GetOptions (\%opts,
 	'export-all',
 	'merge-fixup',
 	'status',
-	'delete'
+	'delete',
+	'rescan'
 ) or die("$usage\nInvalid Option\n");
 
 die ("Must specify site!\n") unless defined $opts{site} || defined $opts{status};
 
-map { $opts{$_} = 0 if !exists($opts{$_}) } qw/merge imagehash getimages redirects rebuild-klcache allpages merge-fixup delete status/;
+map { $opts{$_} = 0 if !exists($opts{$_}) } qw/merge imagehash getimages redirects rebuild-klcache allpages merge-fixup delete status rescan/;
 
 # Create a user agent object
 my $ua = LWP::UserAgent->new;
@@ -137,14 +134,16 @@ if ($opts{'export-all'}) {
 	exit 0;
 }
 
+=head
 if ($opts{'merge-fixup'}) {
 	create_version_templates();
 	exit 0;
 }
+=cut
 
-unlink "wp.txt";
-unlink "esplus.txt";
-unlink "es.txt" if $opts{merge};
+#unlink "wp.txt";
+#unlink "esplus.txt";
+#unlink "es.txt" if $opts{merge};
 
 my $siteinfo = $dbh->selectrow_hashref("select * from sites where name = '$opts{site}'");
 
@@ -157,6 +156,9 @@ elsif ($opts{page}) {
 }
 elsif ($opts{allpages}) {
 	@pages = allpages();
+}
+elsif ($opts{'relink-images'}) {
+	relink_images($opts{site});
 }
 else {
 	print STDERR "Either --file, --page or --allpages must be supplied\n\n";
@@ -213,6 +215,7 @@ sub process_page
 
 	my $isimage;
 	my $filter;
+	my $orig_page_name;
 
 	undef %tmplflds;
 
@@ -223,32 +226,31 @@ sub process_page
 	$isimage = ($page =~ /^Image:/i) ? 1 : 0;
 
 	print "\tExporting From " . $siteinfo->{desc} . "\n";
-	my $xml = get_page($site, $page);
-
-	# Pass in reference to $realpage, gets correct title if we supplied a redirect.
-	my $realpage;
-	my $text = parse_export_xml($xml, \$realpage);
-	if (!defined $text) {
-		# undef returned only for images, where 'missing' attributes is set.
+	my %meta;
+	my $text = get_page($site, $page, \%meta);
+	if (exists $meta{missing}) {
+		# check if 'missing' attribute is set. Usually happens for images
 		# - indicates image description is on Wikimedia Commons.
 		print "\tExporting From Wikimedia Commons\n";
 		$site = 'CO';
-		my $xml = get_page($site, $page);
-		$text = parse_export_xml($xml, \$realpage);
+		my $text = get_page($site, $page, \%meta);
 	}
 
 	# No such page!
-	if (!defined $text) {
+	if (exists $meta{missing}) {
 		print "\tPage Does Not Exist: $page\n";
 		return;
 	}
 
-	if ($page ne $realpage) {
-		print "\tActual Page Title: $realpage\n";
-		$page = $realpage;
+	if ($page ne $meta{realpage}) {
+		print "\tActual Page Title: $meta{realpage}\n";
+		$orig_page_name = $page;
+		$page = $meta{realpage};
 	}
 
-	my $page_id = store_page($dbh, $site, $page, $text, \%tmplflds, $parent_page_id);
+	get_infobox_fields($text) if defined $text;
+
+	my $page_id = store_page($dbh, $site, $page, $text, \%tmplflds, $parent_page_id, \%meta);
 
 	# page_id will be zero if page already exists and does not need updating.
 	if ($page_id && ($site ne 'ES')) {
@@ -257,38 +259,62 @@ sub process_page
 		print "\tPage Linked to $page (id = $page_id) is id $link_page_id\n";
 
 		$text = process_text($page, $text, $link_page_id);
-		store_revision($dbh, $sites->{$site}{id}, $page_id, 'ESMERGE', $text);
-	}
-
-	# Identify Images
-	if ($opts{getimages}) {
-		my @images = ($text =~ /\[\[(Image:[^\#\|\]]+)/gi);
-		map { s/[^[:ascii:]]+//g; process_page($site, $_, $page_id); } @images;
+		store_revision($dbh, $sites->{$site}{id}, $page_id, 'ESMERGE', $text, \%meta);
 	}
 
 	if (($tmplflds{frequently_updated} =~ /yes/i) || ($site eq 'ES')){
+		my $text; # Shield outer $text;
+
 		print "\tNEED TO GET VERSION TEMPLATE!!\n\n" unless $site eq 'ES';
 
 		undef %tmplflds;
-		my $xml = get_page($site, "Template:Latest_stable_release/$page");
-		$text = parse_export_xml($xml, \$realpage);
-		my $ib = extract_bracketed($text, '{}');
-		get_template_fields($ib);
-		store_page($dbh, $site, "Template:Latest_stable_release/$page", $text, \%tmplflds, $page_id)
-			if defined $text;
+		undef %meta;
+		my $text = get_page($site, "Template:Latest stable release/$page", \%meta);
+		if (!exists $meta{missing} && !exists $meta{uptodate}) {
+			my $ib = extract_bracketed("$text", '{}'); # Quote $text variable to prevent modification.
+			get_template_fields($ib);
+			print "Storing 'Template:Latest stable release/$page\n";
+			store_page($dbh, $site, "Template:Latest stable release/$page", $text, \%tmplflds, $page_id, \%meta);
+		}
 
 		undef %tmplflds;
-		$xml = get_page($site, "Template:Latest_preview_release/$page");
-		$text = parse_export_xml($xml, \$realpage);
-		$ib = extract_bracketed($text, '{}');
-		get_template_fields($ib);
-		store_page($dbh, $site, "Template:Latest_preview_release/$page", $text, \%tmplflds, $page_id)
-			if defined $text;
+		undef %meta;
+		$text = get_page($site, "Template:Latest preview release/$page", \%meta);
+		if (!exists $meta{missing} && !exists $meta{uptodate}) {
+			my $ib = extract_bracketed("$text", '{}'); # Quote $text variable to prevent modification.
+			get_template_fields($ib);
+			print "Storing 'Template:Latest preview release/$page\n";
+			store_page($dbh, $site, "Template:Latest preview release/$page", $text, \%tmplflds, $page_id, \%meta);
+		}
+	}
+	else {
+		# Need to create some version templates, if appropriate infobox fields exist
+		if ($tmplflds{template} =~ /infobox/i) {
+			my ($latest_release_version, $latest_release_date, $latest_preview_version, $latest_preview_date);
+
+			$latest_release_version = $tmplflds{latest_release_version};
+			$latest_release_date = $tmplflds{latest_release_date};
+			$latest_preview_version = $tmplflds{latest_preview_version};
+			$latest_preview_date = $tmplflds{latest_preview_date};
+
+			create_release_template($site, $page, 'Latest_stable_release', $latest_release_version, $latest_release_date, $page_id)
+				if $latest_release_version;
+			create_release_template($site, $page, 'Latest_preview_release', $latest_preview_version, $latest_preview_date, $page_id)
+				if $latest_preview_version;
+		}
+	}
+
+	# Identify Images
+	if ($text && $opts{getimages}) {
+		my $nocomments = $text;
+		$nocomments =~ s/<!--.*?-->//g;
+		my @images = ($nocomments =~ /\[\[(Image:[^\#\|\]]+)/gi);
+		map { s/[^[:ascii:]]+//g; s/<!--.*?-->//g; process_page($site, $_, $page_id); } @images;
 	}
 
 	# If we are getting a Image: page, then go get the corresponding image file
 	my $image_src;
-	$image_src = get_image($page) if ($isimage && $page_id);
+	$image_src = get_image($page) if ($isimage && $page_id && ($site ne 'ES'));
 
 	# Do Wikipedia Revision Info Export
 	get_contributors($site, $page, $page_id);
@@ -297,10 +323,12 @@ sub process_page
 	if ($opts{redirects}) {
 		print "\tCreating Redirect Pages\n";
 		my @redirs = get_redirects($page,$site,1);
+		push @redirs, $orig_page_name if defined $orig_page_name;
 		map { create_redirect_text($page, $site, $_) } @redirs;
 	}
 }
 
+=head
 sub create_version_templates
 {
 	my ($title, $site, $latest_preview_date, $latest_preview_version);
@@ -363,6 +391,7 @@ EOF
 		store_page($dbh, $site, $page, $text, \%tmplflds);
 	}
 }
+=cut
 
 sub get_contributors
 {
@@ -371,21 +400,21 @@ sub get_contributors
 	my $page_id = shift;
 
 	my $contrib_page = $page;
-	$contrib_page =~ s/:/_/g;
+	#$contrib_page =~ s/:/ /g;
 	$contrib_page = "Template:WPContrib/$contrib_page";
 
 	my $text;
+	my %meta;
 
 	print "\tExporting Contributors from " . $sites->{$site}{desc} . "...\n";
 
 	if ($site eq 'ES') {
-		my $xml = get_page($site, $contrib_page);
-		$text = parse_export_xml($xml);
+		my $text = get_page($site, $contrib_page, \%meta);
+		return if (exists $meta{missing} || exists $meta{uptodate});
 	}
 	else {
 		my %contribs;
 
-		# Get details from Wikimedia commons if we just got an image from there.
 		my $url = "http://" . $sites->{$site}{url} . "/api.php";
 		my $q = "action=query&prop=revisions&titles=$page&rvlimit=max&rvprop=user&format=xml";
 		my $xml = do_query($url, $q);
@@ -400,6 +429,7 @@ sub get_contributors
 
 		$text = <<EOF
 == $page - Wikipedia Contributors ==
+
 ''The following people have contributed to the [[$linkpage]] article on Wikipedia, prior to it being imported into Encoresoup''
 <div class=\"references-small\" style=\"-moz-column-count:3; -webkit-column-count:3; column-count:3;\">
 EOF
@@ -409,18 +439,19 @@ EOF
 		$text .= "\n</div>\n";
 	}
 
-	store_page($dbh, $site, $contrib_page, $text, undef, $page_id);
+	print "Storing $contrib_page\n";
+	store_page($dbh, $site, $contrib_page, $text, undef, $page_id, \%meta);
 }
 
 sub parse_export_xml
 {
 	my $xml = shift;
-	my $realpage = shift; # Must be a reference;
+	my $meta = shift; # Must be a reference;
 
-	my $title = "";
-	my $text = "";
-	my $revid = 0;
-	my $revts = "";
+	my $title;
+	my $text;
+	my $revid;
+	my $revts;
 	my $missing = 0;
 
 	my %pages;
@@ -436,25 +467,23 @@ sub parse_export_xml
 					},
 				'page' => sub
 					{ 
+						$title = $_->att('title');
+
 						# If missing attribute set, then discard this page and return undef.
 						if (exists $_->atts->{missing}) {
-							$missing = 1;
-							return;
+							$meta->{missing} = 1 if defined $meta;
 						}
-					
-						$title = $_->att('title');
 					}
 			},
 		pretty_print => 'indented'
 	);
 	$twig->parse($xml);
 
-	return undef if $missing;
-
-	$$realpage = $title if defined $realpage && ref $realpage;
-
-	$meta{revid} = $revid;
-	$meta{revts} = $revts;
+	if (defined $meta) {
+		$meta->{realpage} = $title;
+		$meta->{revid} = $revid;
+		$meta->{revts} = $revts;
+	}
 
 	return $text;
 }
@@ -585,8 +614,6 @@ sub process_text
 		$text =~ s/\{\{for[^\}]*\}\}//gi;
 		$text =~ s/\{\{expand[^\}]*\}\}//gi;
 		$text =~ s/<!-- Release version update\? Don't edit this page, just click on the version number! -->//gi;
-
-		get_infobox_fields($text);
 	}
 
 	return $text;
@@ -596,11 +623,37 @@ sub get_page
 {
 	my $site = shift;
 	my $page = shift;
+	my $meta = shift;
 
 	my $url = "http://" . $sites->{$site}{url} . "/api.php";
 
-	my $q = "action=query&prop=revisions&titles=$page&rvlimit=1&rvprop=content|ids|timestamp&redirects=1&format=xml";
-	return do_query($url, $q);
+	$page = uri_unescape($page);
+	$page = uri_escape($page);
+
+	my $q = "action=query&prop=revisions&titles=$page&rvlimit=1&rvprop=ids|timestamp&redirects=1&format=xml";
+	my $xml =  do_query($url, $q);
+	my $text = parse_export_xml($xml, $meta);
+
+	# Check to see if the page already exists, if it does has it been updated?
+	my ($page_id, $last_revid) = page_in_cache($site, $meta->{realpage});
+
+	if (defined $meta && defined $page_id) {
+		$meta->{existing_page_id} = $page_id;
+		$meta->{last_revid} = $last_revid;
+	}
+
+	# Indicate where page already in datacache and has not been updated.
+	if (defined $meta && exists $meta->{existing_page_id} && ($meta->{last_revid} == $meta->{revid})) {
+		$meta->{uptodate} = 1;
+		return undef;
+	}
+
+	# Page does not exist or is out of date, so go get the text
+	print "\tPage out-of-date ... retrieving content\n" if defined $meta && exists $meta->{existing_page_id};
+	my $q = "action=query&prop=revisions&titles=$page&rvlimit=1&rvprop=ids|timestamp|content&redirects=1&format=xml";
+	my $xml =  do_query($url, $q);
+	my $text = parse_export_xml($xml, $meta);
+	return $text;
 }
 
 sub do_query
@@ -633,7 +686,7 @@ sub get_infobox_fields
 	undef %tmplflds;
 
 	my ($prefix) = $text =~ /^(.*)\{\{\s*infobox/ism;
-	return unless $prefix;
+	return unless defined $prefix;
 	my $ib = extract_bracketed($text, '{}', quotemeta $prefix);
 
 	get_template_fields($ib);
@@ -668,7 +721,7 @@ sub get_template_fields
     # Put back wikilink delimiter
     $tmplfld =~ s/¦/|/g;
 
-		my ($key, $val) = split(/=/, $tmplfld);
+		my ($key, $val) = split(/=/, $tmplfld, 2);
 		map { s/^\s*//; s/\s*$//; } ($key, $val);
 		$key =~ s/\s/_/g;
 
@@ -680,12 +733,12 @@ sub get_template_fields
 
 sub create_release_template
 {
+	my $site = shift;
 	my $title = shift;
 	my $type = shift;
 	my $version = shift;
 	my $date = shift;
-
-	my $file = 'esplus.txt';
+	my $page_id = shift;
 
 	# Remove download wikilink
 	$version =~ s/\[http:[^\s]*\s([^\]]*)\]/\1/;
@@ -694,14 +747,13 @@ sub create_release_template
 	$date =~ s/\[\[([^\]]*)\]\]/\1/g;
 	$date =~ s/release date and age/release_date/;
 	$date =~ s/release date/release_date/;
+	$date =~ s/release_date\|(mf|df)=(.*?)\|/release_date\|/;
 	$date = '{{release_date|' . UnixDate($date,"%Y|%m|%d") . '}}'
 			unless $date =~/^\{\{release/;
-	
-	open FH, ">>:utf8", $file;
 
-	print FH <<EOF
-{{-start-}}
-'''Template:$type/$title'''
+	my $release_page = "Template:$type/$title";
+
+	my $text = <<EOF
 <!-- Please note: This template is auto-generated, so don't change anything except the version and date! -->
 {{Release|
  article = $title
@@ -712,11 +764,10 @@ sub create_release_template
 <noinclude>
 Back to article "'''[[$title]]'''"
 </noinclude>
-{{-stop-}}
 EOF
 ;
 
-	close FH
+	store_page($dbh, $site, $release_page, $text, undef, $page_id);
 }
 
 sub create_redirect_text
@@ -831,6 +882,9 @@ sub get_redirects
 
 	my @redirects;
 
+	$page = uri_unescape($page);
+	$page = uri_escape($page);
+
 	# Get all redirects for page.
 	my $wpapi = "http://en.wikipedia.org/w/api.php";
 	my $esapi = "http://encoresoup.net/api.php";
@@ -872,7 +926,7 @@ sub parse_redir_xml
 			},
 		pretty_print => 'indented'
 	);
-	$twig->parse($xml);
+	eval { $twig->parse($xml); };
 
 	return ($cont, @titles);
 }
@@ -930,23 +984,13 @@ sub parse_allpages_xml
 	return ($cont, @titles);
 }
 
-sub store_page
+sub page_in_cache
 {
-	my $dbh = shift;
 	my $site = shift;
 	my $title = shift;
-	my $text = shift;
-	my $tmplflds = shift;
-	my $parent_page = shift;
-
-	my $revision_id;
-	my $text_id;
-	my $template_id;
 
 	my $site_id = $sites->{$site}{id};
-	die "Unknown site: '$site'\n" if !defined $site_id;
 
-	# Check to see if the page already exists, if it does has it been updated?
 	my $page_id = 0;
 	my $last_revid = 0;
 	($page_id, $last_revid) = $dbh->selectrow_array(
@@ -962,22 +1006,50 @@ sub store_page
 		$title
 	);
 
+	return ($page_id, $last_revid);
+}
+
+sub delete_page_id
+{
+	my $page_id = shift;
+
+	$dbh->do("delete from pages where id = $page_id");
+	$dbh->do("delete from revisions where page_id = $page_id");
+	$dbh->do("delete from text where page_id = $page_id");
+	$dbh->do("delete from templates where page_id = $page_id");
+	$dbh->do("delete from tmplflds where page_id = $page_id");
+	$dbh->do("delete from categories where page_id = $page_id");
+	$dbh->do("delete from pagelinks where page_id_parent = $page_id");
+	$dbh->do("delete from pagelinks where page_id_child = $page_id");
+}
+
+sub store_page
+{
+	my $dbh = shift;
+	my $site = shift;
+	my $title = shift;
+	my $text = shift;
+	my $tmplflds = shift;
+	my $parent_page = shift;
+	my $meta = shift;
+
+	my $revision_id;
+	my $text_id;
+	my $template_id;
+
+	my $site_id = $sites->{$site}{id};
+	die "Unknown site: '$site'\n" if !defined $site_id;
+
 	# If page already in datacache and has not been updated, then just return.
-	if (defined $last_revid && ($last_revid == $meta{revid})) {
+	if (defined $meta && exists $meta->{uptodate}) {
 		print "\tPage '$title' is already up to date!\n";
 		return 0;
 	}
 
 	# If newer version exists, delete the old details
-	if ($page_id) {
-		$dbh->do("delete from pages where page_id = $page_id");
-		$dbh->do("delete from revisions where page_id = $page_id");
-		$dbh->do("delete from text where page_id = $page_id");
-		$dbh->do("delete from templates where page_id = $page_id");
-		$dbh->do("delete from tmplflds where page_id = $page_id");
-		$dbh->do("delete from categories where page_id = $page_id");
-		$dbh->do("delete from pagelinks where page_id_parent = $page_id");
-		$dbh->do("delete from pagelinks where page_id_child = $page_id");
+	if ($meta->{existing_page_id}) {
+		print "\tNewer version of '$title' exists, deleting existing details from cache\n";
+		delete_page_id($meta->{existing_page_id});
 	}
 
 	$dbh->do(
@@ -998,9 +1070,9 @@ sub store_page
 		$title,
 	);
 
-	$page_id = $dbh->last_insert_id(undef, undef, undef, undef);
+	my $page_id = $dbh->last_insert_id(undef, undef, undef, undef);
 
-	my $revision_id = store_revision($dbh, $site_id, $page_id, 'ORIG', $text);
+	my $revision_id = store_revision($dbh, $site_id, $page_id, 'ORIG', $text, $meta);
 
 	if (defined $tmplflds) {
 		my $tname = $tmplflds->{template};
@@ -1069,16 +1141,12 @@ sub store_page
 		$dbh->do(
 		 "insert into pagelinks
 			(
-				site_id_parent,
 				page_id_parent,
-				site_id_child,
 				page_id_child
 			)
 			values
 			(
-				$site_id,
 				$parent_page,
-				$site_id,
 				$page_id
 			)"
 		);
@@ -1094,7 +1162,10 @@ sub store_revision
 	my $page_id = shift;
 	my $action = shift;
 	my $text = shift;
+	my $meta = shift;
 	
+	my $revid = $meta->{revid} || 0;
+
 	$dbh->do(
 	 "insert into revisions
 	 	(
@@ -1108,8 +1179,8 @@ sub store_revision
 		values (
 			$page_id,
 			$site_id,
-			$meta{revid},
-			'$meta{revts}',
+			$revid,
+			'$meta->{revts}',
 			'$action',
 			1
 		)"
@@ -1158,7 +1229,7 @@ sub export_pages
 	my $updsql = ($updated) ? "and a.updated = 1" : "";
 	my $parsql = ($parent) ?
 		"and l.page_id_parent = $parent" :
-		"and b.name = '$site' and l.page_id_parent is null";
+		"and b.name = '$site' and lp.id is null";
 
 	my $sth = $dbh->prepare(
 	 "select a.id, a.title, d.text
@@ -1171,12 +1242,14 @@ sub export_pages
 			  on c.id = d.revision_id
 			left join pagelinks l
 				on a.id = l.page_id_child
-				and a.site_id = l.site_id_child
-				and a.site_id = l.site_id_parent
+			left join pages lp
+				on lp.id = l.page_id_parent
+				and ((a.site_id = 1 and lp.site_id = 1)
+            or (a.site_id <> 1 and lp.site_id <> 1))
 		where c.action = a.latest_action
 		$parsql
 		$updsql
-		order by title"
+		order by a.title"
 	);
 
 	$sth->execute();
@@ -1198,6 +1271,24 @@ sub export_pages
 	}
 }
 
+sub existing_page_text
+{
+	my $page_id = shift;
+
+	my ($text) = $dbh->selectrow_array(
+	 "select c.text
+		from pages a
+			inner join revisions b
+				on a.id = b.page_id
+				and a.latest_action = b.action
+			inner join text c
+			  on b.id = c.revision_id
+		where a.id = $page_id"
+	);
+
+	return $text;
+}
+
 sub link_matching_page
 {
 	my $dbh = shift;
@@ -1214,9 +1305,7 @@ sub link_matching_page
 	($link_page_id) = $dbh->selectrow_array(
 	 "select page_id_parent
 	  from pagelinks
-		where site_id_parent = $site_id
-		and page_id_parent = $page_id
-		and site_id_child = $es_site_id"
+		where page_id_parent = $page_id"
 	);
 
 	return if $link_page_id;
@@ -1244,15 +1333,11 @@ sub link_matching_page
 	$dbh->do(
 	 "insert into pagelinks
 	  (
-			site_id_parent,
 		  page_id_parent,
-			site_id_child,
 			page_id_child
 		)
 		select 
-			$site_id,
 			$page_id,
-			$es_site_id,
 			$link_page_id"
 	);
 
@@ -1302,15 +1387,7 @@ sub delete_page
 		return 0;
 	}
 
-	$dbh->do("delete from pages where id = $page_id");
-	$dbh->do("delete from revisions where page_id = $page_id");
-	$dbh->do("delete from text where page_id = $page_id");
-	$dbh->do("delete from templates where page_id = $page_id");
-	$dbh->do("delete from tmplflds where page_id = $page_id");
-	$dbh->do("delete from categories where page_id = $page_id");
-	$dbh->do("delete from pagelinks where page_id_parent = $page_id");
-	$dbh->do("delete from pagelinks where page_id_child = $page_id");
+	delete_page_id($page_id);
 
 	print "\tPage DELETED!\n";
 }
-	
