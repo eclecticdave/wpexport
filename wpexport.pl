@@ -65,6 +65,7 @@ use Term::ProgressBar;
 use MediaWiki::API;
 use DBI;
 use URI::Escape;
+use Encode;
 
 binmode STDOUT, ':utf8';
 $| = 1;
@@ -94,15 +95,17 @@ GetOptions (\%opts,
 	'allpages',
 	'export-updated|export',
 	'export-all',
-	'merge-fixup',
 	'status',
 	'delete',
-	'rescan'
+	'update',
+	'relink-images',
+	'nocontrib',
+	'import'
 ) or die("$usage\nInvalid Option\n");
 
 die ("Must specify site!\n") unless defined $opts{site} || defined $opts{status};
 
-map { $opts{$_} = 0 if !exists($opts{$_}) } qw/merge imagehash getimages redirects rebuild-klcache allpages merge-fixup delete status rescan/;
+map { $opts{$_} = 0 if !exists($opts{$_}) } qw/merge imagehash getimages redirects rebuild-klcache allpages delete status update relink-images nocontrib import/;
 
 # Create a user agent object
 my $ua = LWP::UserAgent->new;
@@ -119,33 +122,27 @@ my $dbh = DBI->connect("dbi:SQLite:dbname=$dbname","","");
 # Cache 'sites' table into hashref
 $sites = $dbh->selectall_hashref("select * from sites", 'name');
 
+my $siteinfo = $dbh->selectrow_hashref("select * from sites where name = '$opts{site}'");
+
 if ($opts{status}) {
 	print_status();
 	exit 0;
 }
 
-if ($opts{'export-updated'}) {
-	export_pages(uc $opts{site}, 0, 1);
+if ($opts{update}) {
+	update_pages($opts{site});
 	exit 0;
 }
 
-if ($opts{'export-all'}) {
-	export_pages(uc $opts{site}, 0, 0);
+if ($opts{'relink-images'}) {
+	relink_images($opts{site});
 	exit 0;
 }
 
-=head
-if ($opts{'merge-fixup'}) {
-	create_version_templates();
+if ($opts{import}) {
+	import_pages($opts{site});
 	exit 0;
 }
-=cut
-
-#unlink "wp.txt";
-#unlink "esplus.txt";
-#unlink "es.txt" if $opts{merge};
-
-my $siteinfo = $dbh->selectrow_hashref("select * from sites where name = '$opts{site}'");
 
 my @pages;
 if ($opts{file}) {
@@ -157,10 +154,7 @@ elsif ($opts{page}) {
 elsif ($opts{allpages}) {
 	@pages = allpages();
 }
-elsif ($opts{'relink-images'}) {
-	relink_images($opts{site});
-}
-else {
+elsif (!$opts{'export-updated'} && !$opts{'export-all'}) {
 	print STDERR "Either --file, --page or --allpages must be supplied\n\n";
 }
 
@@ -196,12 +190,33 @@ if ($opts{delete}) {
 	exit 0;
 }
 
-# Reset 'updated' flags
-$dbh->do("update pages set updated = 0");
+if (!@pages) {
+	if ($opts{'export-updated'}) {
+		export_pages({site => uc $opts{site}, updated => 1});
+		exit 0;
+	}
+	elsif ($opts{'export-all'}) {
+		export_pages({site => uc $opts{site}, updated => 0});
+		exit 0;
+	}
+}
 
 # while loop - allows for additional pages to be pushed onto the end of @pages;
 while (my $page = shift @pages) {
-	process_page($opts{site}, $page);
+	if ($opts{'export-updated'}) {
+		export_pages({site => uc $opts{site}, page => $page, updated => 1});
+		exit 0;
+	}
+	elsif ($opts{'export-all'}) {
+		export_pages({site => uc $opts{site}, page => $page, updated => 0});
+		exit 0;
+	}
+	else {
+		# Reset 'updated' flags
+		$dbh->do("update pages set updated = 0");
+
+		process_page($opts{site}, $page);
+	}
 }
 
 $dbh->disconnect();
@@ -261,6 +276,10 @@ sub process_page
 		$text = process_text($page, $text, $link_page_id);
 		store_revision($dbh, $sites->{$site}{id}, $page_id, 'ESMERGE', $text, \%meta);
 	}
+	else {
+		# Get the existing page_id for child pages to link to.
+		$page_id = $meta{existing_page_id};
+	}
 
 	if (($tmplflds{frequently_updated} =~ /yes/i) || ($site eq 'ES')){
 		my $text; # Shield outer $text;
@@ -317,7 +336,7 @@ sub process_page
 	$image_src = get_image($page) if ($isimage && $page_id && ($site ne 'ES'));
 
 	# Do Wikipedia Revision Info Export
-	get_contributors($site, $page, $page_id);
+	get_contributors($site, $page, $page_id) unless $opts{nocontrib};
 
 	# Add redirects
 	if ($opts{redirects}) {
@@ -409,7 +428,7 @@ sub get_contributors
 	print "\tExporting Contributors from " . $sites->{$site}{desc} . "...\n";
 
 	if ($site eq 'ES') {
-		my $text = get_page($site, $contrib_page, \%meta);
+		$text = get_page($site, $contrib_page, \%meta);
 		return if (exists $meta{missing} || exists $meta{uptodate});
 	}
 	else {
@@ -562,7 +581,7 @@ sub process_text
 		$text =~ s/\[\[([^\]\|:]*?)\]\]/&process_link($1)/ge;
 
 		# Add Wikipedia-Attrib template for comparison purposes.
-		$text = "{{Wikipedia-Attrib|$title}}" . $text;
+		$text = "{{Wikipedia-Attrib|$title}}\n" . $text;
 
 		# Remove Portal and Commons templates
 		$text =~ s/\{\{portal[^\}]*\}\}//gi;
@@ -1021,6 +1040,7 @@ sub delete_page_id
 	$dbh->do("delete from categories where page_id = $page_id");
 	$dbh->do("delete from pagelinks where page_id_parent = $page_id");
 	$dbh->do("delete from pagelinks where page_id_child = $page_id");
+	$dbh->do("delete from redirects where page_id = $page_id");
 }
 
 sub store_page
@@ -1219,18 +1239,24 @@ sub store_revision
 
 sub export_pages
 {
-	my $site = shift;
-	my $parent = shift;
-	my $updated = shift;
+	my $opts = shift;
+
+	my $site = $opts->{site};
+	my $page = $opts->{page};
+	my $parent = $opts->{parent} || 0;
+	my $updated = $opts->{updated} || 0;
 	my $level = shift || 0;
 
 	unlink $sites->{$site}{file} if !$parent;
 
 	my $updsql = ($updated) ? "and a.updated = 1" : "";
 	my $parsql = ($parent) ?
-		"and l.page_id_parent = $parent" :
+		"and l.page_id_parent = $parent and lp.id is not null" :
 		"and b.name = '$site' and lp.id is null";
 
+	$parsql .= "\nand a.title = " . $dbh->quote($page) if (!$parent && defined $page);
+
+	# There must be a better way of doing this, but I'm too tired right now!
 	my $sth = $dbh->prepare(
 	 "select a.id, a.title, d.text
 		from pages a
@@ -1256,6 +1282,8 @@ sub export_pages
 
 	my ($page_id, $title, $text);
 	while (($page_id, $title, $text) = $sth->fetchrow_array) {
+		$text = decode_utf8($text);
+		$title = decode_utf8($title);
 		print ("\t" x $level . "Exporting $title...\n");
 
 		open FH, ">>:utf8", $sites->{$site}{file};
@@ -1267,7 +1295,36 @@ sub export_pages
 
 		close FH;
 
-		export_pages($site, $page_id, $updated, $level+1);
+		$opts->{parent} = $page_id;
+		export_pages($opts, $level+1);
+	}
+}
+
+sub update_pages
+{
+	my $site = shift;
+
+	my $sth = $dbh->prepare(
+	 "select a.title
+		from pages a
+		  inner join sites b
+			  on a.site_id = b.id
+		where b.name = '$site'
+		and not exists
+		(
+			select 1
+			from pagelinks l
+			where l.page_id_child = a.id
+		)
+		order by a.title"
+	);
+
+	$sth->execute();
+
+	my $title;
+	while (($title) = $sth->fetchrow_array) {
+		$title = decode_utf8($title);
+		process_page($site, $title);
 	}
 }
 
@@ -1301,15 +1358,6 @@ sub link_matching_page
 
 	my $link_page_id = 0;
 
-	# First check if there is already a link!
-	($link_page_id) = $dbh->selectrow_array(
-	 "select page_id_parent
-	  from pagelinks
-		where page_id_parent = $page_id"
-	);
-
-	return if $link_page_id;
-
 	($link_page_id) = $dbh->selectrow_array(
 	 "select id
 	  from pages
@@ -1328,6 +1376,16 @@ sub link_matching_page
 	}
 
 	return unless $link_page_id;
+
+	# First check if there is already a link!
+	my ($count) = $dbh->selectrow_array(
+	 "select count(*)
+	  from pagelinks
+		where page_id_parent = $page_id
+		and page_id_child = $link_page_id"
+	);
+
+	return if $count;
 
 	# Link the pages together
 	$dbh->do(
@@ -1390,4 +1448,89 @@ sub delete_page
 	delete_page_id($page_id);
 
 	print "\tPage DELETED!\n";
+}
+
+sub relink_images
+{
+	my $site = shift;
+
+	my $sth = $dbh->prepare(
+	 "select a.id, a.title
+		from pages a
+		  inner join sites b
+			  on a.site_id = b.id
+		where b.name = '$site'
+		and not exists
+		(
+			select 1
+			from pagelinks l
+			where l.page_id_child = a.id
+		)
+		order by a.id"
+	);
+
+	$sth->execute();
+
+	my ($page_id, $title);
+	while (($page_id, $title) = $sth->fetchrow_array) {
+		my $text = existing_page_text($page_id);
+
+		print "Relinking Images in $title\n";
+
+		if ($text) {
+			my $nocomments = $text;
+			$nocomments =~ s/<!--.*?-->//g;
+			my @images = ($nocomments =~ /\[\[(Image:[^\#\|\]]+)/gi);
+			map {
+				s/[^[:ascii:]]+//g;
+				s/<!--.*?-->//g;
+
+				my $link_id = link_matching_page($dbh, $site, $_, $page_id);
+				if (defined $link_id) {
+					print "\tPage $_ Relinked to Parent Page $page_id\n";
+				}
+			} @images;
+		}
+	}
+}
+
+sub import_pages
+{
+	my $site = shift;
+	
+	my $file = $sites->{$site}{file};
+
+	my $title = "";
+	my $text = "";
+	my $atstart = 0;
+
+	open FH, "<:utf8", $file;
+
+	while (<FH>) {
+		chomp;
+
+		if ($_ eq '{{-start-}}') {
+			$atstart = 1;
+			next;
+		}
+
+		if ($atstart && ($_ =~ /^'''.*'''$/)) {
+			($title) = /^'''(.*)'''$/;
+			$atstart = 0;
+			next;
+		}
+
+		if ($_ eq '{{-stop-}}') {
+			print "TITLE: $title\n\n";
+			#Needs some work
+			#store_page($dbh, $site, $title, $text, undef, undef, undef);
+
+			$title = $text = "";
+			next;
+		}
+
+		$text .= "$_\n";
+	}
+
+	close FH;
 }
