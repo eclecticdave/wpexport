@@ -14,6 +14,8 @@ CREATE TABLE pages (
   title TEXT NOT NULL,
 	updated INTEGER,
 	latest_action TEXT,
+	parent_id INTEGER,
+	parent_page TEXT,
 
 	UNIQUE (site_id, title)
 );
@@ -80,15 +82,15 @@ CREATE TABLE categories (
 );
 
 CREATE TABLE pagelinks (
-	id INTEGER PRIMARY KEY NOT NULL,
-	site_id_parent INTEGER NOT NULL,
-	page_id_parent INTEGER NOT NULL,
-	site_id_child INTEGER NOT NULL,
-	page_id_child INTEGER NOT NULL
+  id INTEGER PRIMARY KEY NOT NULL,
+  site_id_parent INTEGER NOT NULL,
+  page_id_parent INTEGER NOT NULL,
+  site_id_child INTEGER NOT NULL,
+  page_id_child INTEGER NOT NULL
 );
 
 create index pagelinks_idx1 on pagelinks
-	(site_id_child, page_id_child, site_id_parent, page_id_parent);
+  (site_id_child, page_id_child, site_id_parent, page_id_parent);
 
 insert into sites
 (
@@ -135,5 +137,17 @@ values
 		'Wikimedia Commons'
 );
 
+create view titles
+as
+select site_id, id as page_id, title, 0 as redirect_id
+from pages
+where parent_id is null
+union all
+select a.site_id, a.page_id, a.title, a.id as redirect_id
+from redirects a
+  inner join pages b
+    on a.page_id = b.id
+where b.parent_id is null;
+ 
 .quit
 

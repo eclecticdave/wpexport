@@ -14,11 +14,7 @@
 #               software - not really useful for non-admins)
 #   --getimages Image pages and files linked from current page will also be
 #               downloaded.
-#		--keeplinks	Specifies file containing list of page titles, one per line.
-#		            Links pointing to these pages will be not be delinked.
 #   --redirects Export redirects pointing to required pages.
-#   --rebuild-klcache Rebuild the keeplinks.cache file for given keeplinks file, add redirects if 
-#                     --redirects is also specified.
 #
 #   One of --file, --page or --allpages must be supplied
 #
@@ -89,9 +85,7 @@ GetOptions (\%opts,
 	'getimages',
   'file=s',
   'page=s',
-	'keeplinks:s',
 	'redirects',
-	'rebuild-klcache',
 	'allpages',
 	'export-updated|export',
 	'export-all',
@@ -100,12 +94,13 @@ GetOptions (\%opts,
 	'update',
 	'relink-images',
 	'nocontrib',
-	'import'
+	'import',
+	'start=s'
 ) or die("$usage\nInvalid Option\n");
 
 die ("Must specify site!\n") unless defined $opts{site} || defined $opts{status};
 
-map { $opts{$_} = 0 if !exists($opts{$_}) } qw/merge imagehash getimages redirects rebuild-klcache allpages delete status update relink-images nocontrib import/;
+map { $opts{$_} = 0 if !exists($opts{$_}) } qw/merge imagehash getimages redirects allpages delete status update relink-images nocontrib import/;
 
 # Create a user agent object
 my $ua = LWP::UserAgent->new;
@@ -158,30 +153,11 @@ elsif (!$opts{'export-updated'} && !$opts{'export-all'}) {
 	print STDERR "Either --file, --page or --allpages must be supplied\n\n";
 }
 
-my %keeplinks;
-if (exists $opts{keeplinks}) {
-	my $klfile = ($opts{keeplinks}) ? $opts{keeplinks} : 'keeplinks.cache';
-	
-	my @keeplinks = map { chomp; s/^\s*//; s/\s*$//; $_ } (read_file($klfile), @pages);
-	%keeplinks = map { lc $_ => 1 } (@keeplinks);
+my $keeplinks = $dbh->selectall_arrayref(
+ "select title from pages where site_id = 1 union select title from redirects where site_id = 1"
+);
 
-	if ($opts{'rebuild-klcache'}) {
-		if ($opts{redirects}) {
-			print "Getting redirects for keeplinks pages\n";
-			my $progress = Term::ProgressBar->new({count => scalar(@keeplinks), ETA => 'linear'});
-			for (my $i = 0; $i < @keeplinks; $i++) {
-				my $link = $keeplinks[$i];
-				my @redirs = get_redirects($link,'WP',0);
-				map { $keeplinks {lc $_} = 1 } (@redirs);
-				$progress->update();
-			}
-
-			open FH, ">:utf8", "keeplinks.cache";
-			print FH join("\n", sort keys %keeplinks);
-			close FH;
-		}
-	}
-}
+my %keeplinks = map { lc $_->[0] => 1 } (@$keeplinks);
 
 if ($opts{delete}) {
 	while (my $page = shift @pages) {
@@ -227,6 +203,7 @@ sub process_page
 	my $site = shift;
 	my $page = shift;
 	my $parent_page_id = shift;
+	my $parent_page = shift;
 
 	my $isimage;
 	my $filter;
@@ -265,7 +242,7 @@ sub process_page
 
 	get_infobox_fields($text) if defined $text;
 
-	my $page_id = store_page($dbh, $site, $page, $text, \%tmplflds, $parent_page_id, \%meta);
+	my $page_id = store_page($dbh, $site, $page, $text, \%tmplflds, $parent_page_id, $parent_page, \%meta);
 
 	# page_id will be zero if page already exists and does not need updating.
 	if ($page_id && ($site ne 'ES')) {
@@ -275,10 +252,15 @@ sub process_page
 
 		$text = process_text($page, $text, $link_page_id);
 		store_revision($dbh, $sites->{$site}{id}, $page_id, 'ESMERGE', $text, \%meta);
+
+		# Do Wikipedia Revision Info Export
+		get_contributors($site, $page, $page_id) unless $opts{nocontrib};
 	}
 	else {
-		# Get the existing page_id for child pages to link to.
+		# Get the existing page for child pages to link to.
 		$page_id = $meta{existing_page_id};
+		$text = existing_page_text($page_id);
+		get_infobox_fields($text) if defined $text;
 	}
 
 	if (($tmplflds{frequently_updated} =~ /yes/i) || ($site eq 'ES')){
@@ -288,22 +270,44 @@ sub process_page
 
 		undef %tmplflds;
 		undef %meta;
-		my $text = get_page($site, "Template:Latest stable release/$page", \%meta);
+		my $tmpl_page = "Template:Latest stable release/$page";
+		my $text = get_page($site, "$tmpl_page", \%meta);
 		if (!exists $meta{missing} && !exists $meta{uptodate}) {
 			my $ib = extract_bracketed("$text", '{}'); # Quote $text variable to prevent modification.
 			get_template_fields($ib);
-			print "Storing 'Template:Latest stable release/$page\n";
-			store_page($dbh, $site, "Template:Latest stable release/$page", $text, \%tmplflds, $page_id, \%meta);
+
+			$tmpl_page = $meta{realpage} if defined $meta{realpage};
+			print "Storing '$tmpl_page'\n";
+			my $tmpl_page_id = store_page($dbh, $site, $tmpl_page, $text, \%tmplflds, $page_id, $page, \%meta);
+
+			if ($tmplflds{template} ne 'Release') {
+				my $latest_release_version = $tmplflds{latest_release_version};
+				my $latest_release_date = $tmplflds{latest_release_date};
+
+				my $text = create_release_template($site, $page, 'Latest_stable_release', $latest_release_version, $latest_release_date, $page_id);
+				store_revision($dbh, $sites->{$site}{id}, $tmpl_page_id, 'ESMERGE', $text, \%meta);
+			}
 		}
 
 		undef %tmplflds;
 		undef %meta;
-		$text = get_page($site, "Template:Latest preview release/$page", \%meta);
+		my $tmpl_page = "Template:Latest preview release/$page";
+		$text = get_page($site, $tmpl_page, \%meta);
 		if (!exists $meta{missing} && !exists $meta{uptodate}) {
 			my $ib = extract_bracketed("$text", '{}'); # Quote $text variable to prevent modification.
 			get_template_fields($ib);
-			print "Storing 'Template:Latest preview release/$page\n";
-			store_page($dbh, $site, "Template:Latest preview release/$page", $text, \%tmplflds, $page_id, \%meta);
+
+			$tmpl_page = $meta{realpage} if defined $meta{realpage};
+			print "Storing '$tmpl_page'\n";
+			my $tmpl_page_id = store_page($dbh, $site, $tmpl_page, $text, \%tmplflds, $page_id, $page, \%meta);
+
+			if ($tmplflds{template} ne 'Release') {
+				my $latest_release_version = $tmplflds{latest_release_version};
+				my $latest_release_date = $tmplflds{latest_release_date};
+
+				my $text = create_release_template($site, $page, 'Latest_preview_release', $latest_release_version, $latest_release_date, $page_id);
+				store_revision($dbh, $sites->{$site}{id}, $tmpl_page_id, 'ESMERGE', $text, \%meta);
+			}
 		}
 	}
 	else {
@@ -316,10 +320,16 @@ sub process_page
 			$latest_preview_version = $tmplflds{latest_preview_version};
 			$latest_preview_date = $tmplflds{latest_preview_date};
 
-			create_release_template($site, $page, 'Latest_stable_release', $latest_release_version, $latest_release_date, $page_id)
-				if $latest_release_version;
-			create_release_template($site, $page, 'Latest_preview_release', $latest_preview_version, $latest_preview_date, $page_id)
-				if $latest_preview_version;
+			if ($latest_release_version) {
+				my $text = create_release_template($site, $page, 'Latest_stable_release', $latest_release_version, $latest_release_date, $page_id);
+				my ($tmpl_page_id, $last_revid) = page_in_cache($site, "Template:Latest_stable_release/$page");
+				store_page($dbh, $site, "Template:Latest_stable_release/$page", $text, undef, $page_id, $page, { existing_page_id => $tmpl_page_id });
+			}
+			if ($latest_preview_version) {
+				my $text = create_release_template($site, $page, 'Latest_preview_release', $latest_preview_version, $latest_preview_date, $page_id);
+				my ($tmpl_page_id, $last_revid) = page_in_cache($site, "Template:Latest_preview_release/$page");
+				store_page($dbh, $site, "Template:Latest_preview_release/$page", $text, undef, $page_id, $page, { existing_page_id => $tmpl_page_id });
+			}
 		}
 	}
 
@@ -328,15 +338,12 @@ sub process_page
 		my $nocomments = $text;
 		$nocomments =~ s/<!--.*?-->//g;
 		my @images = ($nocomments =~ /\[\[(Image:[^\#\|\]]+)/gi);
-		map { s/[^[:ascii:]]+//g; s/<!--.*?-->//g; process_page($site, $_, $page_id); } @images;
+		map { s/[^[:ascii:]]+//g; s/<!--.*?-->//g; process_page($site, $_, $page_id, $page); } @images;
 	}
 
 	# If we are getting a Image: page, then go get the corresponding image file
 	my $image_src;
 	$image_src = get_image($page) if ($isimage && $page_id && ($site ne 'ES'));
-
-	# Do Wikipedia Revision Info Export
-	get_contributors($site, $page, $page_id) unless $opts{nocontrib};
 
 	# Add redirects
 	if ($opts{redirects}) {
@@ -346,71 +353,6 @@ sub process_page
 		map { create_redirect_text($page, $site, $_) } @redirs;
 	}
 }
-
-=head
-sub create_version_templates
-{
-	my ($title, $site, $latest_preview_date, $latest_preview_version);
-
-	my $sth = $dbh->prepare(
-	 "select d.title, e.name, b.value, c.value
-		from templates a
-		  inner join tmplflds b
-			  on a.id = b.template_id
-		  inner join tmplflds c
-				on a.id = c.template_id
-		  inner join pages d
-		    on d.id = a.page_id
-			inner join sites e
-				on e.id = d.site_id
-		where a.name in ('Infobox Software','Infobox_Software')
-		and b.field = 'latest_preview_date'
-		and c.field = 'latest_preview_version'
-		and not exists
-		(
-			select 1
-			from pages f
-			where f.title = 'Template:Latest_preview_release/' || d.title
-			and f.site_id = d.site_id
-		)"
-	);
-
-	$sth->execute;
-
-	my @row;
-	while (@row = $sth->fetchrow_array) {
-		my ($title, $site, $latest_preview_date, $latest_preview_version) = @row;
-		
-		my %tmplflds = (
-			article => $title,
-			release_type => 'Latest_preview_release',
-			release_version => $latest_preview_version,
-			release_date => $latest_preview_date
-		);
-
-		my $text = <<EOF
-{{-start-}}\n'''$title'''
-<!-- Please note: This template is auto-generated, so don't change anything except the version and date! -->
-{{Release
-|article = $title
-|release_type=Latest_preview_release
-|release_version = $latest_preview_version
-|release_date = $latest_preview_date
-}}
-<noinclude>
-Back to article "'''[[$title]]'''"
-</noinclude>
-{{-stop-}}
-EOF
-;
-		my $page = "Template:Latest_preview_release/$title";
-		print "\tCreating Page: $page\n";
-		$meta{revid} = 0;
-		$meta{revts} = '';
-		store_page($dbh, $site, $page, $text, \%tmplflds);
-	}
-}
-=cut
 
 sub get_contributors
 {
@@ -459,7 +401,9 @@ EOF
 	}
 
 	print "Storing $contrib_page\n";
-	store_page($dbh, $site, $contrib_page, $text, undef, $page_id, \%meta);
+	my ($contrib_page_id, $last_revid) = page_in_cache($site, $contrib_page);
+	$meta{existing_page_id} = $contrib_page_id;
+	store_page($dbh, $site, $contrib_page, $text, undef, $page_id, $page, \%meta);
 }
 
 sub parse_export_xml
@@ -593,25 +537,27 @@ sub process_text
 		# Fix Stub templates
 		$text =~ s/\{\{[^\}]*stub\}\}/{{stub}}/gi;
 
-		print "\tGetting Encoresoup Categories (page_id = $link_page_id)\n";
-		my $catsref = $dbh->selectall_arrayref(
-		 "select name
-			from categories
-			where page_id = $link_page_id
-			and site_id = $es_site_id"
-		);
+		if (defined $link_page_id) {
+			print "\tGetting Encoresoup Categories (page_id = $link_page_id)\n";
+			my $catsref = $dbh->selectall_arrayref(
+			 "select name
+				from categories
+				where page_id = $link_page_id
+				and site_id = $es_site_id"
+			);
 
-		my @cats = map { '[[Category:' . $_->[0] . ']]' } @$catsref;
-		my $catstr = join("\n", @cats);
+			my @cats = map { '[[Category:' . $_->[0] . ']]' } @$catsref;
+			my $catstr = join("\n", @cats);
 				
-		# Replace Categories with marker
-		$text =~ s/\[\[Category:[^\]]*\]\]/\%marker\%/gi;
+			# Replace Categories with marker
+			$text =~ s/\[\[Category:[^\]]*\]\]/\%marker\%/gi;
 
-		# Replace first Marker with Encoresoup Categories
-		$text =~ s/\%marker\%/$catstr/;
+			# Replace first Marker with Encoresoup Categories
+			$text =~ s/\%marker\%/$catstr/;
 		
-		# Remove other markers
-		$text =~ s/\%marker\%//g;
+			# Remove other markers
+			$text =~ s/\%marker\%//g;
+		}
 
 		# Comment out language links
 		$text =~ s/\[\[([a-z][a-z]|ast|simple):([^\]]*)\]\]/<!--[[$1:$2]]-->/gi;
@@ -633,6 +579,12 @@ sub process_text
 		$text =~ s/\{\{for[^\}]*\}\}//gi;
 		$text =~ s/\{\{expand[^\}]*\}\}//gi;
 		$text =~ s/<!-- Release version update\? Don't edit this page, just click on the version number! -->//gi;
+
+		# Move infobox to start of text
+		#my ($prefix) = $text =~ /^(.*)\{\{\s*infobox/ism;
+		#return $text unless defined $prefix;
+		#my $ib = extract_bracketed($text, '{}', quotemeta $prefix);
+		#$text = $ib . $text;
 	}
 
 	return $text;
@@ -709,6 +661,8 @@ sub get_infobox_fields
 	my $ib = extract_bracketed($text, '{}', quotemeta $prefix);
 
 	get_template_fields($ib);
+
+	return($text, $ib);
 }
 
 sub get_template_fields
@@ -748,6 +702,8 @@ sub get_template_fields
 		
 		#print "Key: '$key'\nVal: '$val'\n\n";
 	}
+
+	return \%tmplflds;
 }
 
 sub create_release_template
@@ -786,7 +742,7 @@ Back to article "'''[[$title]]'''"
 EOF
 ;
 
-	store_page($dbh, $site, $release_page, $text, undef, $page_id);
+	return $text;
 }
 
 sub create_redirect_text
@@ -795,13 +751,8 @@ sub create_redirect_text
 	my $site = shift;
 	my $redir = shift;
 
-	#print FH <<EOF
-#{{-start-}}
-#'''$redir'''
-#REDIRECT [[$page]]
-#{{-stop-}}
-#EOF
-#;
+	$page = $dbh->quote($page);
+	$redir = $dbh->quote($redir);
 
 	$dbh->do(
 	 "insert or replace into redirects
@@ -813,13 +764,13 @@ sub create_redirect_text
 		select
 			a.id,
 			a.site_id,
-			'$redir'
+			$redir
 		from pages a
 		  inner join sites b
 			  on a.site_id = b.id
-		where a.title = '$page'
+		where a.title = $page
 		and b.name = '$site'"
-	);
+	) || die "While executing:\n" . $dbh->{Statement};
 }
 
 sub get_image
@@ -829,8 +780,9 @@ sub get_image
 	my $wppath;
 	my $espath;
 
-	# Remove Image: prefix
+	# Remove Image: and File: prefixes
 	$page =~ s/^Image://i;
+	$page =~ s/^File://i;
 
 	# Normalise image name
 	$page =~ s/\s/_/g;
@@ -1025,6 +977,25 @@ sub page_in_cache
 		$title
 	);
 
+	# If not found - check to see if title refers to a redirect
+	# (if it does it's the real page we want to use)
+	if (!$page_id) {
+		($page_id, $last_revid) = $dbh->selectrow_array(
+		 "select b.page_id, b.revid
+			from pages a
+				inner join revisions b
+					on a.id = b.page_id
+				inner join redirects c
+					on a.id = c.page_id
+			where c.title = ?
+			and a.site_id = $site_id
+			and b.action = 'ORIG'",
+
+			undef,
+			$title
+		);
+	}
+
 	return ($page_id, $last_revid);
 }
 
@@ -1050,6 +1021,7 @@ sub store_page
 	my $title = shift;
 	my $text = shift;
 	my $tmplflds = shift;
+	my $parent_page_id = shift;
 	my $parent_page = shift;
 	my $meta = shift;
 
@@ -1157,18 +1129,12 @@ sub store_page
 		);
 	}
 
-	if (defined $parent_page) {
+	if (defined $parent_page_id) {
 		$dbh->do(
-		 "insert into pagelinks
-			(
-				page_id_parent,
-				page_id_child
-			)
-			values
-			(
-				$parent_page,
-				$page_id
-			)"
+		 "update pages
+			set parent_id = $parent_page_id,
+					parent_page = (select title from pages where id = $parent_page_id)
+			where id = $page_id"
 		);
 	}
 
@@ -1251,8 +1217,8 @@ sub export_pages
 
 	my $updsql = ($updated) ? "and a.updated = 1" : "";
 	my $parsql = ($parent) ?
-		"and l.page_id_parent = $parent and lp.id is not null" :
-		"and b.name = '$site' and lp.id is null";
+		"and a.parent_id = $parent" :
+		"and b.name = '$site' and a.parent_id is null";
 
 	$parsql .= "\nand a.title = " . $dbh->quote($page) if (!$parent && defined $page);
 
@@ -1266,12 +1232,6 @@ sub export_pages
 				on a.id = c.page_id
 			inner join text d
 			  on c.id = d.revision_id
-			left join pagelinks l
-				on a.id = l.page_id_child
-			left join pages lp
-				on lp.id = l.page_id_parent
-				and ((a.site_id = 1 and lp.site_id = 1)
-            or (a.site_id <> 1 and lp.site_id <> 1))
 		where c.action = a.latest_action
 		$parsql
 		$updsql
@@ -1297,6 +1257,8 @@ sub export_pages
 
 		$opts->{parent} = $page_id;
 		export_pages($opts, $level+1);
+
+		export_redirects($site, $title, $page_id, $level);
 	}
 }
 
@@ -1304,18 +1266,17 @@ sub update_pages
 {
 	my $site = shift;
 
+	my $startcond = "";
+	$startcond = "and a.title >= '$opts{start}'" if defined $opts{start};
+
 	my $sth = $dbh->prepare(
 	 "select a.title
 		from pages a
 		  inner join sites b
 			  on a.site_id = b.id
 		where b.name = '$site'
-		and not exists
-		(
-			select 1
-			from pagelinks l
-			where l.page_id_child = a.id
-		)
+		and a.parent_id is null
+		$startcond
 		order by a.title"
 	);
 
@@ -1391,12 +1352,18 @@ sub link_matching_page
 	$dbh->do(
 	 "insert into pagelinks
 	  (
+			site_id_parent,
 		  page_id_parent,
+			site_id_child,
 			page_id_child
 		)
-		select 
+		values
+		(
+			$site_id,
 			$page_id,
-			$link_page_id"
+			$es_site_id,
+			$link_page_id
+		)"
 	);
 
 	return $link_page_id;
@@ -1445,6 +1412,19 @@ sub delete_page
 		return 0;
 	}
 
+	my $sth = $dbh->prepare(
+	 "select title
+		from pages
+		where parent_id = $page_id
+		and site_id = $site_id"
+	);
+
+	$sth->execute;
+
+	while (my ($title) = $sth->fetchrow_array) {
+		delete_page($site, $title);
+	}
+
 	delete_page_id($page_id);
 
 	print "\tPage DELETED!\n";
@@ -1454,18 +1434,15 @@ sub relink_images
 {
 	my $site = shift;
 
+	my $site_id = $sites->{$site}{id};
+
+	my $site_id_clause = ($site_id == 1) ? "site_id = 1" : "site_id <> 1";
+
 	my $sth = $dbh->prepare(
 	 "select a.id, a.title
 		from pages a
-		  inner join sites b
-			  on a.site_id = b.id
-		where b.name = '$site'
-		and not exists
-		(
-			select 1
-			from pagelinks l
-			where l.page_id_child = a.id
-		)
+		where a.site_id = $site_id
+		and a.parent_id is null
 		order by a.id"
 	);
 
@@ -1484,10 +1461,30 @@ sub relink_images
 			map {
 				s/[^[:ascii:]]+//g;
 				s/<!--.*?-->//g;
+				s/Image:(.)/Image:\u\1/i;
 
-				my $link_id = link_matching_page($dbh, $site, $_, $page_id);
+				my ($link_id) = $dbh->selectrow_array("select id from pages where title = '$_' and $site_id_clause");
+				# If not found, try again replacing spaces in title with underscores
+				if (!defined $link_id) {
+					s/\s/_/g;
+					($link_id) = $dbh->selectrow_array("select id from pages where title = '$_' and $site_id_clause");
+				}
+				# Still not found, try all underscores to spaces!
+				if (!defined $link_id) {
+					s/_/ /g;
+					($link_id) = $dbh->selectrow_array("select id from pages where title = '$_' and $site_id_clause");
+				}
 				if (defined $link_id) {
+					$dbh->do(
+					 "update pages
+						set parent_id = $page_id,
+								parent_page = '$title'
+						where id = $link_id"
+					);
 					print "\tPage $_ Relinked to Parent Page $page_id\n";
+				}
+				else {
+					print "Page $_ Not Found!\n";
 				}
 			} @images;
 		}
@@ -1530,6 +1527,37 @@ sub import_pages
 		}
 
 		$text .= "$_\n";
+	}
+
+	close FH;
+}
+
+sub export_redirects
+{
+	my $site = shift;
+	my $title = shift;
+	my $page_id = shift;
+	my $level = shift;
+
+	open FH, ">>:utf8", $sites->{$site}{file};
+
+	my $sth = $dbh->prepare(
+	 "select title
+		from redirects
+		where page_id = $page_id"
+	);
+
+	$sth->execute();
+
+	while (my ($redir) = $sth->fetchrow_array) {
+		next if $redir =~ /^User:/;
+
+		print ("\t" x ($level+1) . "Exporting Redirect $redir...\n");
+		
+		print FH "{{-start-}}\n";
+		print FH "'''$redir'''\n";
+		print FH "#REDIRECT [[$title]]\n";
+		print FH "{{-stop-}}\n";
 	}
 
 	close FH;
