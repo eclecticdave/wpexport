@@ -4,6 +4,7 @@ CREATE TABLE sites (
   url TEXT NOT NULL,
   file TEXT,
 	desc TEXT,
+	alt_url TEXT,
 
 	UNIQUE (name)
 );
@@ -112,29 +113,16 @@ insert into sites
 		name,
 		url,
 		file,
-		desc
+		desc,
+		alt_url
 )
 values
 (
 		'WP',
 		'en.wikipedia.org/w',
 		'wp.txt',
-		'Wikipedia'
-);
-
-insert into sites
-(
-		name,
-		url,
-		file,
-		desc
-)
-values
-(
-		'CO',
-		'commons.wikimedia.org/w',
-		'co.txt',
-		'Wikimedia Commons'
+		'Wikipedia',
+		'commons.wikimedia.org/w'
 );
 
 create view titles

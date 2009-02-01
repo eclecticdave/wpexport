@@ -14,7 +14,6 @@
 #               software - not really useful for non-admins)
 #   --getimages Image pages and files linked from current page will also be
 #               downloaded.
-#   --redirects Export redirects pointing to required pages.
 #
 #   One of --file, --page or --allpages must be supplied
 #
@@ -85,7 +84,6 @@ GetOptions (\%opts,
 	'getimages',
   'file=s',
   'page=s',
-	'redirects',
 	'allpages',
 	'export-updated|export',
 	'export-all',
@@ -100,7 +98,7 @@ GetOptions (\%opts,
 
 die ("Must specify site!\n") unless defined $opts{site} || defined $opts{status};
 
-map { $opts{$_} = 0 if !exists($opts{$_}) } qw/merge imagehash getimages redirects allpages delete status update relink-images nocontrib import/;
+map { $opts{$_} = 0 if !exists($opts{$_}) } qw/merge imagehash getimages allpages delete status update relink-images nocontrib import/;
 
 # Create a user agent object
 my $ua = LWP::UserAgent->new;
@@ -215,18 +213,11 @@ sub process_page
 
 	print "Processing Page: $page\n";
 
-	$isimage = ($page =~ /^Image:/i) ? 1 : 0;
+	$isimage = ($page =~ /^(?:Image|File):/i) ? 1 : 0;
 
 	print "\tExporting From " . $siteinfo->{desc} . "\n";
 	my %meta;
 	my $text = get_page($site, $page, \%meta);
-	if (exists $meta{missing}) {
-		# check if 'missing' attribute is set. Usually happens for images
-		# - indicates image description is on Wikimedia Commons.
-		print "\tExporting From Wikimedia Commons\n";
-		$site = 'CO';
-		my $text = get_page($site, $page, \%meta);
-	}
 
 	# No such page!
 	if (exists $meta{missing}) {
@@ -238,6 +229,24 @@ sub process_page
 		print "\tActual Page Title: $meta{realpage}\n";
 		$orig_page_name = $page;
 		$page = $meta{realpage};
+	}
+
+	# We don't support File: namespace pages yet, so store them as Image:
+	$page =~ s/^File:/Image:/;
+
+	# If Image, check to see if the page already exists, check used in get_page might have been for File: namespace.
+	if ($page =~ /^Image:/) {
+		my ($img_page_id, $img_last_revid) = page_in_cache($site, $page);
+
+		if (defined $img_page_id) {
+			$meta{existing_page_id} = $img_page_id;
+			$meta{last_revid} = $img_last_revid;
+		}
+
+		# Indicate where page already in datacache and has not been updated.
+		if ($meta{last_revid} == $meta{revid}) {
+			$meta{uptodate} = 1;
+		}
 	}
 
 	get_infobox_fields($text) if defined $text;
@@ -276,15 +285,22 @@ sub process_page
 			my $ib = extract_bracketed("$text", '{}'); # Quote $text variable to prevent modification.
 			get_template_fields($ib);
 
-			$tmpl_page = $meta{realpage} if defined $meta{realpage};
-			print "Storing '$tmpl_page'\n";
+			# Check to see if the page already exists (check in get_page uses real page name which might not be
+			# the same as the name we want to store the template under.
+			my ($tmpl_page_id, $tmpl_last_revid) = page_in_cache($site, $tmpl_page);
+
+			if (defined $tmpl_page_id) {
+				$meta{existing_page_id} = $tmpl_page_id;
+				$meta{last_revid} = $tmpl_last_revid;
+			}
+
 			my $tmpl_page_id = store_page($dbh, $site, $tmpl_page, $text, \%tmplflds, $page_id, $page, \%meta);
 
 			if ($tmplflds{template} ne 'Release') {
 				my $latest_release_version = $tmplflds{latest_release_version};
 				my $latest_release_date = $tmplflds{latest_release_date};
 
-				my $text = create_release_template($site, $page, 'Latest_stable_release', $latest_release_version, $latest_release_date, $page_id);
+				my $text = create_release_template($site, $page, 'Latest stable release', $latest_release_version, $latest_release_date, $page_id);
 				store_revision($dbh, $sites->{$site}{id}, $tmpl_page_id, 'ESMERGE', $text, \%meta);
 			}
 		}
@@ -297,15 +313,22 @@ sub process_page
 			my $ib = extract_bracketed("$text", '{}'); # Quote $text variable to prevent modification.
 			get_template_fields($ib);
 
-			$tmpl_page = $meta{realpage} if defined $meta{realpage};
-			print "Storing '$tmpl_page'\n";
+			# Check to see if the page already exists (check in get_page uses real page name which might not be
+			# the same as the name we want to store the template under.
+			my ($tmpl_page_id, $tmpl_last_revid) = page_in_cache($site, $tmpl_page);
+
+			if (defined $tmpl_page_id) {
+				$meta{existing_page_id} = $tmpl_page_id;
+				$meta{last_revid} = $tmpl_last_revid;
+			}
+
 			my $tmpl_page_id = store_page($dbh, $site, $tmpl_page, $text, \%tmplflds, $page_id, $page, \%meta);
 
 			if ($tmplflds{template} ne 'Release') {
 				my $latest_release_version = $tmplflds{latest_release_version};
 				my $latest_release_date = $tmplflds{latest_release_date};
 
-				my $text = create_release_template($site, $page, 'Latest_preview_release', $latest_release_version, $latest_release_date, $page_id);
+				my $text = create_release_template($site, $page, 'Latest preview release', $latest_release_version, $latest_release_date, $page_id);
 				store_revision($dbh, $sites->{$site}{id}, $tmpl_page_id, 'ESMERGE', $text, \%meta);
 			}
 		}
@@ -321,14 +344,14 @@ sub process_page
 			$latest_preview_date = $tmplflds{latest_preview_date};
 
 			if ($latest_release_version) {
-				my $text = create_release_template($site, $page, 'Latest_stable_release', $latest_release_version, $latest_release_date, $page_id);
-				my ($tmpl_page_id, $last_revid) = page_in_cache($site, "Template:Latest_stable_release/$page");
-				store_page($dbh, $site, "Template:Latest_stable_release/$page", $text, undef, $page_id, $page, { existing_page_id => $tmpl_page_id });
+				my $text = create_release_template($site, $page, 'Latest stable release', $latest_release_version, $latest_release_date, $page_id);
+				my ($tmpl_page_id, $last_revid) = page_in_cache($site, "Template:Latest stable release/$page");
+				store_page($dbh, $site, "Template:Latest stable release/$page", $text, undef, $page_id, $page, { existing_page_id => $tmpl_page_id });
 			}
 			if ($latest_preview_version) {
-				my $text = create_release_template($site, $page, 'Latest_preview_release', $latest_preview_version, $latest_preview_date, $page_id);
-				my ($tmpl_page_id, $last_revid) = page_in_cache($site, "Template:Latest_preview_release/$page");
-				store_page($dbh, $site, "Template:Latest_preview_release/$page", $text, undef, $page_id, $page, { existing_page_id => $tmpl_page_id });
+				my $text = create_release_template($site, $page, 'Latest preview release', $latest_preview_version, $latest_preview_date, $page_id);
+				my ($tmpl_page_id, $last_revid) = page_in_cache($site, "Template:Latest preview release/$page");
+				store_page($dbh, $site, "Template:Latest preview release/$page", $text, undef, $page_id, $page, { existing_page_id => $tmpl_page_id });
 			}
 		}
 	}
@@ -337,21 +360,18 @@ sub process_page
 	if ($text && $opts{getimages}) {
 		my $nocomments = $text;
 		$nocomments =~ s/<!--.*?-->//g;
-		my @images = ($nocomments =~ /\[\[(Image:[^\#\|\]]+)/gi);
+		my @images = ($nocomments =~ /\[\[((?:Image|File):[^\#\|\]]+)/gi);
 		map { s/[^[:ascii:]]+//g; s/<!--.*?-->//g; process_page($site, $_, $page_id, $page); } @images;
 	}
 
 	# If we are getting a Image: page, then go get the corresponding image file
-	my $image_src;
-	$image_src = get_image($page) if ($isimage && $page_id && ($site ne 'ES'));
+	get_image($page) if ($isimage && $page_id && ($site ne 'ES'));
 
 	# Add redirects
-	if ($opts{redirects}) {
-		print "\tCreating Redirect Pages\n";
-		my @redirs = get_redirects($page,$site,1);
-		push @redirs, $orig_page_name if defined $orig_page_name;
-		map { create_redirect_text($page, $site, $_) } @redirs;
-	}
+	print "\tCreating Redirect Pages\n";
+	my @redirs = get_redirects($page,$site,1);
+	push @redirs, $orig_page_name if defined $orig_page_name;
+	map { create_redirect_text($page, $site, $_) } @redirs;
 }
 
 sub get_contributors
@@ -386,7 +406,7 @@ sub get_contributors
 		}
 
 		my $linkpage = $page;
-		$linkpage = ':' . $page if $page =~ /^Image:/i;
+		$linkpage = ':' . $page if $page =~ /^(?:Image|File):/i;
 
 		$text = <<EOF
 == $page - Wikipedia Contributors ==
@@ -415,10 +435,10 @@ sub parse_export_xml
 	my $text;
 	my $revid;
 	my $revts;
-	my $missing = 0;
 
 	my %pages;
 
+	delete $meta->{missing} if defined $meta;
 	my $twig = XML::Twig->new(
 	 	twig_handlers =>
 			{ 
@@ -502,7 +522,7 @@ sub process_text
 
 	my $es_site_id = $sites->{ES}{id};
 
-	my $isimage = ($title =~ /^Image:/i) ? 1 : 0;
+	my $isimage = ($title =~ /^(?:Image|File):/i) ? 1 : 0;
 
 	if ($isimage) {
 		# Unlink Wiki-links
@@ -514,7 +534,7 @@ sub process_text
 
 		# Add Wikipedia-Attrib-Image template if it doesn't already exist
 		my $image = $title;
-		$image =~ s/^Image://i;
+		$image =~ s/^(?:Image|File)://i;
 		$text .= "\n{{Wikipedia-Attrib-Image|$image}}" unless $text =~ /\{\{Wikipedia-Attrib-Image/i;
 	}
 	else {
@@ -597,6 +617,7 @@ sub get_page
 	my $meta = shift;
 
 	my $url = "http://" . $sites->{$site}{url} . "/api.php";
+	my $alturl = "http://" . $sites->{$site}{alt_url} . "/api.php";
 
 	$page = uri_unescape($page);
 	$page = uri_escape($page);
@@ -604,6 +625,15 @@ sub get_page
 	my $q = "action=query&prop=revisions&titles=$page&rvlimit=1&rvprop=ids|timestamp&redirects=1&format=xml";
 	my $xml =  do_query($url, $q);
 	my $text = parse_export_xml($xml, $meta);
+
+	if (defined $meta && (exists $meta->{missing}) && (defined $sites->{$site}{alt_url})) {
+		$url = $alturl;
+		$page = $meta->{realpage} if exists $meta->{realpage};
+		$page = uri_escape($page);
+		$q = "action=query&prop=revisions&titles=$page&rvlimit=1&rvprop=ids|timestamp&redirects=1&format=xml";
+		$xml = do_query($url, $q);
+		$text = parse_export_xml($xml, $meta);
+	}
 
 	# Check to see if the page already exists, if it does has it been updated?
 	my ($page_id, $last_revid) = page_in_cache($site, $meta->{realpage});
@@ -822,7 +852,7 @@ sub get_image
 	}
 	else {
 		print "SUCCESS: $url => '$espath'\n\n";
-		return 'WP';
+		return;
 	}
 
 	print "Trying Wikimedia Commons ...\n";
@@ -839,10 +869,9 @@ sub get_image
 	}
 	else {
 		print "SUCCESS: $url => '$espath'\n\n";
-		return 'CO';
 	}
 
-	return 'F';
+	return;
 }
 
 sub get_redirects
@@ -1086,6 +1115,8 @@ sub store_page
 		my $template_id = $dbh->last_insert_id(undef, undef, undef, undef);
 
 		while (my ($key,$val) = each %$tmplflds) {
+			$key = $dbh->quote($key);
+			$val = $dbh->quote($val);
 			$dbh->do(
 			 "insert or replace into tmplflds
 				(
@@ -1100,8 +1131,8 @@ sub store_page
 					$template_id,
 					$page_id,
 					$site_id,
-					'$key',
-					'$val'
+					$key,
+					$val
 				)"
 			);
 		}
@@ -1436,8 +1467,6 @@ sub relink_images
 
 	my $site_id = $sites->{$site}{id};
 
-	my $site_id_clause = ($site_id == 1) ? "site_id = 1" : "site_id <> 1";
-
 	my $sth = $dbh->prepare(
 	 "select a.id, a.title
 		from pages a
@@ -1457,22 +1486,23 @@ sub relink_images
 		if ($text) {
 			my $nocomments = $text;
 			$nocomments =~ s/<!--.*?-->//g;
-			my @images = ($nocomments =~ /\[\[(Image:[^\#\|\]]+)/gi);
+			my @images = ($nocomments =~ /\[\[((?:Image|File):[^\#\|\]]+)/gi);
 			map {
 				s/[^[:ascii:]]+//g;
 				s/<!--.*?-->//g;
 				s/Image:(.)/Image:\u\1/i;
+				s/File:(.)/File:\u\1/i;
 
-				my ($link_id) = $dbh->selectrow_array("select id from pages where title = '$_' and $site_id_clause");
+				my ($link_id) = $dbh->selectrow_array("select id from pages where title = '$_' and site_id = $site_id");
 				# If not found, try again replacing spaces in title with underscores
 				if (!defined $link_id) {
 					s/\s/_/g;
-					($link_id) = $dbh->selectrow_array("select id from pages where title = '$_' and $site_id_clause");
+					($link_id) = $dbh->selectrow_array("select id from pages where title = '$_' and site_id = $site_id");
 				}
 				# Still not found, try all underscores to spaces!
 				if (!defined $link_id) {
 					s/_/ /g;
-					($link_id) = $dbh->selectrow_array("select id from pages where title = '$_' and $site_id_clause");
+					($link_id) = $dbh->selectrow_array("select id from pages where title = '$_' and site_id = $site_id");
 				}
 				if (defined $link_id) {
 					$dbh->do(
