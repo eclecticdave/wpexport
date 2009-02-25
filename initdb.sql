@@ -21,6 +21,9 @@ CREATE TABLE pages (
 	UNIQUE (site_id, title)
 );
 
+CREATE INDEX pages_idx1
+on pages (title, site_id);
+
 CREATE TABLE revisions (
 	id INTEGER PRIMARY KEY NOT NULL,
 	page_id INTEGER NOT NULL,
@@ -43,6 +46,9 @@ CREATE TABLE text (
 	UNIQUE (revision_id)
 );
 
+CREATE INDEX text_idx1
+on text (page_id);
+
 CREATE TABLE templates (
   id INTEGER PRIMARY KEY NOT NULL,
   page_id INTEGER NOT NULL,
@@ -63,6 +69,9 @@ CREATE TABLE tmplflds (
 	UNIQUE (template_id, field)
 );
 
+create unique index tmplflds_idx1
+on tmplflds (template_id, field);
+
 CREATE TABLE redirects (
   id INTEGER PRIMARY KEY NOT NULL,
   page_id INTEGER NOT NULL,
@@ -71,6 +80,12 @@ CREATE TABLE redirects (
 
 	UNIQUE (page_id, title)
 );
+
+CREATE INDEX redirects_idx1
+on redirects (title, site_id);
+
+create unique index redirects_idx2
+on redirects (page_id, title);
 
 CREATE TABLE categories (
 	id INTEGER PRIMARY KEY NOT NULL,
@@ -81,6 +96,9 @@ CREATE TABLE categories (
 
 	UNIQUE (revision_id, name)
 );
+
+create unique index categories_idx1
+on categories (revision_id, name);
 
 CREATE TABLE pagelinks (
   id INTEGER PRIMARY KEY NOT NULL,
