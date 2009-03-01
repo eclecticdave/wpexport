@@ -192,12 +192,13 @@ if (!@pages) {
 }
 
 # while loop - allows for additional pages to be pushed onto the end of @pages;
+my $first = 1;
 while (my $page = shift @pages) {
 	if ($opts{'export-updated'}) {
-		export_pages({site => uc $opts{site}, page => $page, updated => 1});
+		export_pages({site => uc $opts{site}, page => $page, updated => 1, append => (($first) ? 0 : 1)});
 	}
 	elsif ($opts{'export-all'}) {
-		export_pages({site => uc $opts{site}, page => $page, updated => 0});
+		export_pages({site => uc $opts{site}, page => $page, updated => 0, append => (($first) ? 0 : 1)});
 	}
 	else {
 		# Reset 'updated' flags
@@ -205,6 +206,8 @@ while (my $page = shift @pages) {
 
 		process_page($opts{site}, $page);
 	}
+
+	$first = 0;
 }
 
 $dbh->disconnect();
@@ -1290,9 +1293,10 @@ sub export_pages
 	my $page = $opts->{page};
 	my $parent = $opts->{parent} || 0;
 	my $updated = $opts->{updated} || 0;
+	my $append = $opts->{append} || 0;
 	my $level = shift || 0;
 
-	unlink $sites->{$site}{file} if !$parent;
+	unlink $sites->{$site}{file} if !$parent && !$append;
 
 	my $updsql = ($updated) ? "and a.updated = 1" : "";
 	my $parsql = ($parent) ?
