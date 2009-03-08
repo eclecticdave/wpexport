@@ -69,7 +69,6 @@ $| = 1;
 my $sites;
 
 my %tmplflds;
-#my %meta;
 
 my $script=basename($0);
 my $usage="Usage: $script [--<opts>]";
@@ -121,13 +120,20 @@ my $dbh = DBI->connect("dbi:SQLite:dbname=$dbname","","");
 # Cache 'sites' table into hashref
 $sites = $dbh->selectall_hashref("select * from sites", 'name');
 
+# Load extension modules
+my @modulenames;
+my @modules;
+if (-f "modules/modules.conf") {
+	@modulenames = map { chomp;  s/^\s*//; s/\s*$//; $_ } read_file("modules/modules.conf");
+
+	for my $modulename (@modulenames) {
+		next if !$modulename || $modulename =~ /^#/;
+		require "modules/$modulename.pm";
+		push @modules, $modulename->new($dbh);
+	}
+}
+
 my $siteinfo = $dbh->selectrow_hashref("select * from sites where name = '$opts{site}'");
-
-my $keeplinks = $dbh->selectall_arrayref(
- "select distinct title from titles"
-);
-
-my %keeplinks = map { lc $_->[0] => 1 } (@$keeplinks);
 
 if ($opts{status}) {
 	print_status();
@@ -248,17 +254,14 @@ sub process_page
 		$page = $meta{realpage};
 	}
 
-	get_template($text, 1) if defined $text;
-
 	my $page_id = store_page($dbh, $site, $page, $text, \%tmplflds, $parent_page_id, $parent_page, \%meta);
 
 	# page_id will be zero if page already exists and does not need updating.
 	if ($page_id && ($site ne 'ES')) {
-		# Try to locate equivalent page on Encoresoup
-		my $link_page_id = link_matching_page($dbh, $site, $page, $page_id);
-		print "\tPage Linked to $page (id = $page_id) is id $link_page_id\n";
+		for my $module (@modules) {
+			$text = $module->process_text($dbh, $page, $site, $text, $page_id);
+		}
 
-		$text = process_text($page, $text, $link_page_id);
 		store_revision($dbh, $sites->{$site}{id}, $page_id, 'ESMERGE', $text, \%meta);
 
 		# Do Wikipedia Revision Info Export
@@ -268,8 +271,9 @@ sub process_page
 		# Get the existing page for child pages to link to.
 		$page_id = $meta{existing_page_id};
 		$text = existing_page_text($page_id);
-		get_template($text, 1) if defined $text;
 	}
+
+	get_template($text, 1) if defined $text;
 
 	if (($tmplflds{frequently_updated} =~ /yes/i) || ($site eq 'ES')){
 		my $text; # Shield outer $text;
@@ -319,6 +323,8 @@ sub process_page
 		}
 	}
 
+	store_properties($dbh, $sites->{$site}{id}, $page_id, \%tmplflds);
+
 	# Identify Images
 	if ($text && $opts{getimages}) {
 		my $nocomments = $text;
@@ -328,7 +334,7 @@ sub process_page
 	}
 
 	# If we are getting a Image: page, then go get the corresponding image file
-	get_image($page) if ($isimage && $page_id && ($site ne 'ES'));
+	get_image($page) if ($isimage && $page_id && !exists $meta{missing} && ($site ne 'ES'));
 
 	# Add redirects
 	print "\tCreating Redirect Pages\n";
@@ -382,13 +388,11 @@ sub rescan_page
 
 	$text = decode_utf8($text);
 
-	# page_id will be zero if page already exists and does not need updating.
 	if ($site ne 'ES') {
-		# Try to locate equivalent page on Encoresoup
-		my $link_page_id = link_matching_page($dbh, $site, $page, $page_id);
+		for my $module (@modules) {
+			$text = $module->process_text($dbh, $page, $site, $text, $page_id);
+		}
 
-		print "\tPage Linked to $page (id = $page_id) is id $link_page_id\n";
-		$text = process_text($page, $text, $link_page_id);
 		store_revision($dbh, $sites->{$site}{id}, $page_id, 'ESMERGE', $text, \%meta);
 	}
 }
@@ -517,118 +521,6 @@ sub parse_rev_xml
 	return $revstartid;
 }
 
-sub process_link
-{
-	my $link = shift;
-	my $desc = shift;
-
-	$link =~ s/^\s*//;
-	$link =~ s/\s*$//;
-
-	if ($keeplinks{lc $link}) {
-		return (defined $desc) ? "[[$link|$desc]]" : "[[$link]]";
-	}
-	else {
-		return (defined $desc) ? $desc : $link;
-	}
-}
-
-sub process_text
-{
-	my $title = shift;
-  my $text = shift;
-  my $link_page_id = shift;
-
-	my $es_site_id = $sites->{ES}{id};
-
-	my $isimage = ($title =~ /^(?:Image|File):/i) ? 1 : 0;
-
-	if ($isimage) {
-		# Unlink Wiki-links
-		$text =~ s/\[\[[^\]:]*?\|(.*?)\]\]/\1/g;
-		$text =~ s/\[\[([^\]:]*?)\]\]/\1/g;
-
-		# Comment-out Categories
-		$text =~ s/(\[\[Category:[^\]]*\]\])/<!-- \1 -->/gi;
-
-		# Add Wikipedia-Attrib-Image template if it doesn't already exist
-		my $image = $title;
-		$image =~ s/^(?:Image|File)://i;
-		$text .= "\n{{Wikipedia-Attrib-Image|$image}}" unless $text =~ /\{\{Wikipedia-Attrib-Image/i;
-	}
-	else {
-		# Processing Wikipedia Extract ...
-
-		# Unlink Wiki-links
-		$text =~ s/\[\[([^\]:]*?)\|(.*?)\]\]/&process_link($1,$2)/ge;
-		$text =~ s/\[\[([^\]\|:]*?)\]\]/&process_link($1)/ge;
-
-		# Add Wikipedia-Attrib template for comparison purposes.
-		$text = "{{Wikipedia-Attrib|$title}}\n" . $text;
-
-		# Remove Portal and Commons templates
-		$text =~ s/\{\{portal[^\}]*\}\}//gi;
-		$text =~ s/\{\{commons[^\}]*\}\}//gi;
-
-		# Fix Infobox_Software templates
-		$text =~ s/\{\{Infobox\sSoftware/{{Infobox_Software/gi;
-
-		# Fix Stub templates
-		$text =~ s/\{\{[^\}]*stub\}\}/{{stub}}/gi;
-
-		if (defined $link_page_id) {
-			print "\tGetting Encoresoup Categories (page_id = $link_page_id)\n";
-			my $catsref = $dbh->selectall_arrayref(
-			 "select name
-				from categories
-				where page_id = $link_page_id
-				and site_id = $es_site_id"
-			);
-
-			my @cats = map { '[[Category:' . $_->[0] . ']]' } @$catsref;
-			my $catstr = join("\n", @cats);
-				
-			# Replace Categories with marker
-			$text =~ s/\[\[Category:[^\]]*\]\]/\%marker\%/gi;
-
-			# Replace first Marker with Encoresoup Categories
-			$text =~ s/\%marker\%/$catstr/;
-		
-			# Remove other markers
-			$text =~ s/\%marker\%//g;
-		}
-
-		# Comment out language links
-		$text =~ s/\[\[([a-z][a-z]|ast|simple):([^\]]*)\]\]/<!--[[$1:$2]]-->/gi;
-
-		# Remove templates not used on Encoresoup
-		$text =~ s/\{\{notability[^\}]*\}\}//gi;
-		$text =~ s/\{\{primarysources[^\}]*\}\}//gi;
-		$text =~ s/\{\{cleanup[^\}]*\}\}//gi;
-		$text =~ s/\{\{unreferenced[^\}]*\}\}//gi;
-		$text =~ s/\{\{nofootnotes[^\}]*\}\}//gi;
-		$text =~ s/\{\{wikify[^\}]*\}\}//gi;
-		$text =~ s/\{\{prose[^\}]*\}\}//gi;
-		$text =~ s/\{\{orphan[^\}]*\}\}//gi;
-		$text =~ s/\{\{this[^\}]*\}\}//gi;
-		$text =~ s/\{\{advert[^\}]*\}\}//gi;
-		$text =~ s/\{\{fact[^\}]*\}\}//gi;
-		$text =~ s/\{\{refimprove[^\}]*\}\}//gi;
-		$text =~ s/\{\{weasel[^\}]*\}\}//gi;
-		$text =~ s/\{\{for[^\}]*\}\}//gi;
-		$text =~ s/\{\{expand[^\}]*\}\}//gi;
-		$text =~ s/<!-- Release version update\? Don't edit this page, just click on the version number! -->//gi;
-
-		# Move infobox to start of text
-		#my ($prefix) = $text =~ /^(.*)\{\{\s*infobox/ism;
-		#return $text unless defined $prefix;
-		#my $ib = extract_bracketed($text, '{}', quotemeta $prefix);
-		#$text = $ib . $text;
-	}
-
-	return $text;
-}
-
 sub get_page
 {
 	my $site = shift;
@@ -709,8 +601,6 @@ sub get_template
 	my $text = shift;
 	my $want_infobox = shift;
 
-	undef %tmplflds;
-
 	my $ib;
 	if ($want_infobox) {
 		my ($prefix) = $text =~ /^(.*)\{\{\s*infobox/ism;
@@ -741,13 +631,12 @@ sub get_template_fields
 
 	my @tmplflds = split(/\|/, $text);
 
-	undef %tmplflds;
-
 	my $tname = shift @tmplflds;
 	$tname =~ s/^\s*//;
 	$tname =~ s/\s*$//;
+	$tname =~ s/\s/_/g;
 
-	$tmplflds{template} = $tname;
+	$tmplflds{template} = $tname unless exists $tmplflds{template};
 	#print "Name: $tname\n\n";
 
 	for my $tmplfld (@tmplflds) {
@@ -1059,12 +948,6 @@ sub store_page
 		return 0;
 	}
 
-	# If newer version exists, delete the old details
-	#if ($meta->{existing_page_id}) {
-	#	print "\tNewer version of '$title' exists, deleting existing details from cache\n";
-	#	delete_page_id($meta->{existing_page_id});
-	#}
-
 	my ($page_id) = $dbh->selectrow_array(
 	 "select id
 		from pages
@@ -1105,61 +988,6 @@ sub store_page
 	}
 
 	my $revision_id = store_revision($dbh, $site_id, $page_id, 'ORIG', $text, $meta);
-
-	if (defined $tmplflds) {
-		my $tname = $tmplflds->{template};
-
-		my ($template_id) = $dbh->selectrow_array(
-		 "select id
-			from templates
-			where page_id = $page_id
-			and name = '$tname'"
-		);
-
-		if (!defined $template_id) {
-			$dbh->do(
-			 "insert into templates
-				(
-					page_id,
-					site_id,
-					name
-				)
-				values
-				(
-					$page_id,
-					$site_id,
-					'$tname'
-				)"
-			);
-
-			$template_id = $dbh->last_insert_id(undef, undef, undef, undef);
-		}
-
-		# TODO: Need to decide what should happen if a template field used to exist, then was subsequently removed.
-		# Should it be deleted here?
-		while (my ($key,$val) = each %$tmplflds) {
-			$key = $dbh->quote($key);
-			$val = $dbh->quote($val);
-			$dbh->do(
-			 "insert or ignore into tmplflds
-				(
-					template_id,
-					page_id,
-					site_id,
-					field, 
-					value
-				)
-				values
-				(
-					$template_id,
-					$page_id,
-					$site_id,
-					$key,
-					$val
-				)"
-			);
-		}
-	}
 
 	# TODO: Need to decide what should happen if a category link used to exist, then was subsequently removed.
 	# Should it be deleted here?
@@ -1393,74 +1221,6 @@ sub existing_page_text
 	);
 
 	return $text;
-}
-
-sub link_matching_page
-{
-	my $dbh = shift;
-	my $site = shift;
-	my $page = shift;
-	my $page_id = shift;
-
-	my $site_id = $sites->{$site}{id};
-	my $es_site_id = $sites->{ES}{id};
-
-	my $link_page_id = 0;
-
-	($link_page_id) = $dbh->selectrow_array(
-	 "select id
-	  from pages
-		where title = ?
-		and site_id = $es_site_id",
-
-		undef,
-		$page
-	);
-
-	if (!$link_page_id) {
-		# There might be a redirect with the matching title
-		($link_page_id) = $dbh->selectrow_array(
-		 "select page_id
-			from redirects
-			where title = ?
-			and site_id = $es_site_id",
-
-			undef,
-			$page
-		);
-	}
-
-	return unless $link_page_id;
-
-	# First check if there is already a link!
-	my ($count) = $dbh->selectrow_array(
-	 "select count(*)
-	  from pagelinks
-		where page_id_parent = $page_id
-		and page_id_child = $link_page_id"
-	);
-
-	return $link_page_id if $count;
-
-	# Link the pages together
-	$dbh->do(
-	 "insert into pagelinks
-	  (
-			site_id_parent,
-		  page_id_parent,
-			site_id_child,
-			page_id_child
-		)
-		values
-		(
-			$site_id,
-			$page_id,
-			$es_site_id,
-			$link_page_id
-		)"
-	);
-
-	return $link_page_id;
 }
 
 sub print_status
@@ -1700,4 +1460,70 @@ sub merge_changes
 	export_pages({site => $from, updated => 0});
 	print "Exporting $to...\n";
 	export_pages({site => $to, updated => 0});
+}
+
+sub store_properties
+{
+	my $dbh = shift;
+	my $site_id = shift;
+	my $page_id = shift;
+	my $tmplflds = shift;
+
+	my $section = $tmplflds->{template};
+
+	my ($section_id) = $dbh->selectrow_array(
+	 "select id
+		from properties
+		where page_id = $page_id
+		and key = '$section'
+		and type = 1"
+	);
+
+	if (!defined $section_id) {
+		$section_id = store_property($dbh, $site_id, $page_id, undef, 1, $section, undef);
+	}
+
+	# TODO: Need to decide what should happen if a template field used to exist, then was subsequently removed.
+	# Should it be deleted here?
+	while (my ($key,$val) = each %$tmplflds) {
+		store_property($dbh, $site_id, $page_id, $section_id, 2, $key, $val);
+	}
+}
+
+sub store_property
+{
+	my $dbh = shift;
+	my $site_id = shift;
+	my $page_id = shift;
+	my $parent_id = shift;
+	my $type = shift;
+	my $key = shift;
+	my $val = shift;
+
+	$key = $dbh->quote($key);
+	$val = (defined $val) ? $dbh->quote($val) : 'NULL';
+	$parent_id = 'NULL' unless defined $parent_id;
+
+	$dbh->do(
+	 "insert or ignore into properties
+		(
+			page_id,
+			site_id,
+			parent_id,
+			type,
+			key, 
+			value
+		)
+		values
+		(
+			$page_id,
+			$site_id,
+			$parent_id,
+			$type,
+			$key,
+			$val
+		)"
+	);
+
+	return $dbh->last_insert_id(undef, undef, undef, undef);
 }

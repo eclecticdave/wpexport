@@ -49,28 +49,17 @@ CREATE TABLE text (
 CREATE INDEX text_idx1
 on text (page_id);
 
-CREATE TABLE templates (
+CREATE TABLE properties (
   id INTEGER PRIMARY KEY NOT NULL,
   page_id INTEGER NOT NULL,
 	site_id INTEGER NOT NULL,
-  name TEXT NOT NULL,
-
-	UNIQUE (page_id, name)
-);
-
-CREATE TABLE tmplflds (
-  id INTEGER PRIMARY KEY NOT NULL,
-  template_id INTEGER NOT NULL,
-  page_id INTEGER NOT NULL,
-	site_id INTEGER NOT NULL,
-  field TEXT NOT NULL,
+	parent_id INTEGER,
+	type INTEGER NOT NULL,
+  key TEXT NOT NULL,
   value TEXT,
 
-	UNIQUE (template_id, field)
+	UNIQUE (page_id, key)
 );
-
-create unique index tmplflds_idx1
-on tmplflds (template_id, field);
 
 CREATE TABLE redirects (
   id INTEGER PRIMARY KEY NOT NULL,
