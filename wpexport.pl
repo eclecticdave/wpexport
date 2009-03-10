@@ -49,18 +49,7 @@
 use strict;
 
 use File::Basename;
-use File::Slurp;
-use LWP::UserAgent;
-use XML::Twig;
-use Text::Balanced qw ( extract_bracketed );
-use Date::Manip;
 use Getopt::Long;
-use MD5;
-use Term::ProgressBar;
-use MediaWiki::API;
-use DBI;
-use URI::Escape;
-use Encode;
 
 binmode STDOUT, ':utf8';
 $| = 1;
@@ -83,7 +72,6 @@ GetOptions (\%opts,
 	'getimages',
   'file=s',
   'page=s',
-	'pageid=i',
 	'allpages',
 	'export-updated|export',
 	'export-all',
@@ -101,62 +89,32 @@ die ("Must specify site!\n") unless defined $opts{site} || defined $opts{status}
 
 map { $opts{$_} = 0 if !exists($opts{$_}) } qw/imagehash getimages allpages delete status update relink-images nocontrib import rescan/;
 
-# Create a user agent object
-my $ua = LWP::UserAgent->new;
-$ua->agent("WPExport/0.1 ");
-$ua->default_header(
-	'Accept-Language' => 'en-US',
-	'Accept-Charset' => 'utf-8'
-);
+my $wpexp = WPExporter->new($opts{db});
 
-# Create MediaWiki::API objects
-my $esobj = MediaWiki::API->new( { api_url => 'http://encoresoup.net/api.php' } );
-
-my $dbname = $opts{db} || 'wpexport.db';
-
-# Connect to local SQLite datacache
-my $dbh = DBI->connect("dbi:SQLite:dbname=$dbname","","");
-
-# Cache 'sites' table into hashref
-$sites = $dbh->selectall_hashref("select * from sites", 'name');
-
-# Load extension modules
-my @modulenames;
-my @modules;
-if (-f "modules/modules.conf") {
-	@modulenames = map { chomp;  s/^\s*//; s/\s*$//; $_ } read_file("modules/modules.conf");
-
-	for my $modulename (@modulenames) {
-		next if !$modulename || $modulename =~ /^#/;
-		require "modules/$modulename.pm";
-		push @modules, $modulename->new($dbh);
-	}
-}
-
-my $siteinfo = $dbh->selectrow_hashref("select * from sites where name = '$opts{site}'");
+$wpexp->load_modules();
 
 if ($opts{status}) {
-	print_status();
+	$wpexp->print_status();
 	exit 0;
 }
 
 if ($opts{update}) {
-	update_pages($opts{site});
+	$wpexp->update_pages($opts{site});
 	exit 0;
 }
 
 if ($opts{'relink-images'}) {
-	relink_images($opts{site});
+	$wpexp->relink_images($opts{site});
 	exit 0;
 }
 
 if ($opts{import}) {
-	import_pages($opts{site});
+	$wpexp->import_pages($opts{site});
 	exit 0;
 }
 
 if ($opts{'merge'}) {
-	merge_changes($opts{merge});
+	$wpexp->merge_changes($opts{merge});
 	exit 0;
 }
 
@@ -168,59 +126,132 @@ elsif ($opts{page}) {
 	@pages = ($opts{page});
 }
 elsif ($opts{allpages}) {
-	@pages = allpages();
+	@pages = $wpexp->allpages();
 }
 elsif (!$opts{'export-updated'} && !$opts{'export-all'} && !$opts{merge}) {
 	print STDERR "Either --file, --page or --allpages must be supplied\n\n";
 }
 
 if ($opts{delete}) {
-	if ($opts{pageid}) {
-		delete_page_id($opts{pageid});
-		exit 0;
-	}
-
 	while (my $page = shift @pages) {
-		delete_page($opts{site}, $page);
+		$wpexp->delete_page($opts{site}, $page);
 	}
 	exit 0;
 }
 
 if (!@pages) {
 	if ($opts{'export-updated'}) {
-		export_pages({site => uc $opts{site}, updated => 1});
+		$wpexp->export_pages({site => uc $opts{site}, updated => 1});
 		exit 0;
 	}
 	elsif ($opts{'export-all'}) {
-		export_pages({site => uc $opts{site}, updated => 0});
+		$wpexp->export_pages({site => uc $opts{site}, updated => 0});
 		exit 0;
 	}
 }
+
+$wpexp->clear_updated_flags();
 
 # while loop - allows for additional pages to be pushed onto the end of @pages;
 my $first = 1;
 while (my $page = shift @pages) {
 	if ($opts{'export-updated'}) {
-		export_pages({site => uc $opts{site}, page => $page, updated => 1, append => (($first) ? 0 : 1)});
+		$wpexp->export_pages({site => uc $opts{site}, page => $page, updated => 1, append => (($first) ? 0 : 1)});
 	}
 	elsif ($opts{'export-all'}) {
-		export_pages({site => uc $opts{site}, page => $page, updated => 0, append => (($first) ? 0 : 1)});
+		$wpexp->export_pages({site => uc $opts{site}, page => $page, updated => 0, append => (($first) ? 0 : 1)});
 	}
 	else {
-		# Reset 'updated' flags
-		$dbh->do("update pages set updated = 0");
 
-		process_page($opts{site}, $page);
+		$wpexp->process_page($opts{site}, $page);
 	}
 
 	$first = 0;
 }
 
-$dbh->disconnect();
 exit 0;
+
+package WPExporter;
+
+use URI::Escape;
+use Encode;
+use Text::Balanced qw ( extract_bracketed );
+use MD5;
+use MediaWiki::API;
+use XML::Twig;
+use LWP::UserAgent;
+use File::Slurp;
+use Date::Manip;
+use Term::ProgressBar;
+use DBI;
+
+sub new
+{
+	my $class = shift;
+	my $dbname = shift || 'wpexport.db';
+
+	my $self = {};
+
+	# Connect to local SQLite datacache
+	my $dbh = DBI->connect("dbi:SQLite:dbname=$dbname","","");
+	$self->{DBH} = $dbh;
+
+	# Cache 'sites' table into hashref
+	$sites = $dbh->selectall_hashref("select * from sites", 'name');
+	$self->{SITES} = $sites;
+
+	# Create MediaWiki::API objects
+	my $esobj = MediaWiki::API->new( { api_url => 'http://encoresoup.net/api.php' } );
+	$self->{ESOBJ} = $esobj;
+
+	# Create a user agent object
+	my $ua = LWP::UserAgent->new;
+	$ua->agent("WPExport/0.1 ");
+	$ua->default_header(
+		'Accept-Language' => 'en-US',
+		'Accept-Charset' => 'utf-8'
+	);
+	$self->{UA} = $ua;
+
+	# Cache valid page titles into 'keeplinks' hashref
+	#my $keeplinks = $dbh->selectall_arrayref("select distinct title from titles");
+	#my %keeplinks = map { lc $_->[0] => 1 } (@$keeplinks);
+	#$self->{KEEPLINKS} = \%keeplinks;
+
+	bless ($self, $class);
+	return $self;
+}
+
+# Load extension modules
+sub load_modules
+{
+	my $self = shift;
+
+	my @modulenames;
+	my @modules;
+	if (-f "modules/modules.conf") {
+		@modulenames = map { chomp;  s/^\s*//; s/\s*$//; $_ } read_file("modules/modules.conf");
+
+		for my $modulename (@modulenames) {
+			next if !$modulename || $modulename =~ /^#/;
+			require "modules/$modulename.pm";
+			push @modules, $modulename->new($wpexp->dbh());
+		}
+	}
+
+	$self->{MODULES} = \@modules;
+}
+
+sub dbh
+{
+	my $self = shift;
+	return $self->{DBH};
+}
 
 sub process_page
 {
+	my $self = shift;
+
 	my $site = shift;
 	my $page = shift;
 	my $parent_page_id = shift;
@@ -237,10 +268,13 @@ sub process_page
 
 	print "Processing Page: $page\n";
 
+	my $dbh = $self->{DBH};
+	my $siteinfo = $dbh->selectrow_hashref("select * from sites where name = '$opts{site}'");
+
 	my $isimage = ($page =~ /^(?:Image|File):/i) ? 1 : 0;
 
 	print "\tExporting From " . $siteinfo->{desc} . "\n";
-	my $text = get_page($site, $page, \%meta);
+	my $text = $self->get_page($site, $page, \%meta);
 
 	# No such page!
 	if (exists $meta{missing}) {
@@ -254,26 +288,26 @@ sub process_page
 		$page = $meta{realpage};
 	}
 
-	my $page_id = store_page($dbh, $site, $page, $text, \%tmplflds, $parent_page_id, $parent_page, \%meta);
+	my $page_id = $self->store_page($dbh, $site, $page, $text, \%tmplflds, $parent_page_id, $parent_page, \%meta);
 
 	# page_id will be zero if page already exists and does not need updating.
 	if ($page_id && ($site ne 'ES')) {
-		for my $module (@modules) {
+		for my $module (@{$self->{MODULES}}) {
 			$text = $module->process_text($dbh, $page, $site, $text, $page_id);
 		}
 
-		store_revision($dbh, $sites->{$site}{id}, $page_id, 'ESMERGE', $text, \%meta);
+		$self->store_revision($dbh, $sites->{$site}{id}, $page_id, 'ESMERGE', $text, \%meta);
 
 		# Do Wikipedia Revision Info Export
-		get_contributors($site, $page, $page_id) unless $opts{nocontrib};
+		$self->get_contributors($dbh, $site, $page, $page_id) unless $opts{nocontrib};
 	}
 	else {
 		# Get the existing page for child pages to link to.
 		$page_id = $meta{existing_page_id};
-		$text = existing_page_text($page_id);
+		$text = $self->existing_page_text($page_id);
 	}
 
-	get_template($text, 1) if defined $text;
+	$self->get_template($text, 1) if defined $text;
 
 	if (($tmplflds{frequently_updated} =~ /yes/i) || ($site eq 'ES')){
 		my $text; # Shield outer $text;
@@ -284,18 +318,18 @@ sub process_page
 			undef %tmplflds;
 			undef %meta;
 			my $tmpl_page = $meta{cachedpage} = "Template:$tmpl/$page";
-			my $text = get_page($site, "$tmpl_page", \%meta);
+			my $text = $self->get_page($site, "$tmpl_page", \%meta);
 			if (!exists $meta{missing} && !exists $meta{uptodate}) {
-				get_template($text,0);
+				$self->get_template($text,0);
 
-				my $tmpl_page_id = store_page($dbh, $site, $tmpl_page, $text, \%tmplflds, $page_id, $page, \%meta);
+				my $tmpl_page_id = $self->store_page($dbh, $site, $tmpl_page, $text, \%tmplflds, $page_id, $page, \%meta);
 
 				if ($tmplflds{template} ne 'Release') {
 					my $latest_release_version = $tmplflds{latest_release_version};
 					my $latest_release_date = $tmplflds{latest_release_date};
 
-					my $text = create_release_template($site, $page, $tmpl, $latest_release_version, $latest_release_date, $page_id);
-					store_revision($dbh, $sites->{$site}{id}, $tmpl_page_id, 'ESMERGE', $text, \%meta);
+					my $text = $self->create_release_template($site, $page, $tmpl, $latest_release_version, $latest_release_date, $page_id);
+					$self->store_revision($dbh, $sites->{$site}{id}, $tmpl_page_id, 'ESMERGE', $text, \%meta);
 				}
 			}
 		}
@@ -311,40 +345,42 @@ sub process_page
 			$latest_preview_date = $tmplflds{latest_preview_date};
 
 			if ($latest_release_version) {
-				my $text = create_release_template($site, $page, 'Latest stable release', $latest_release_version, $latest_release_date, $page_id);
-				my ($tmpl_page_id, $last_revid) = page_in_cache($site, "Template:Latest stable release/$page");
-				store_page($dbh, $site, "Template:Latest stable release/$page", $text, undef, $page_id, $page, { existing_page_id => $tmpl_page_id });
+				my $text = $self->create_release_template($site, $page, 'Latest stable release', $latest_release_version, $latest_release_date, $page_id);
+				my ($tmpl_page_id, $last_revid) = $self->page_in_cache($site, "Template:Latest stable release/$page");
+				$self->store_page($dbh, $site, "Template:Latest stable release/$page", $text, undef, $page_id, $page, { existing_page_id => $tmpl_page_id });
 			}
 			if ($latest_preview_version) {
-				my $text = create_release_template($site, $page, 'Latest preview release', $latest_preview_version, $latest_preview_date, $page_id);
-				my ($tmpl_page_id, $last_revid) = page_in_cache($site, "Template:Latest preview release/$page");
-				store_page($dbh, $site, "Template:Latest preview release/$page", $text, undef, $page_id, $page, { existing_page_id => $tmpl_page_id });
+				my $text = $self->create_release_template($site, $page, 'Latest preview release', $latest_preview_version, $latest_preview_date, $page_id);
+				my ($tmpl_page_id, $last_revid) = $self->page_in_cache($site, "Template:Latest preview release/$page");
+				$self->store_page($dbh, $site, "Template:Latest preview release/$page", $text, undef, $page_id, $page, { existing_page_id => $tmpl_page_id });
 			}
 		}
 	}
 
-	store_properties($dbh, $sites->{$site}{id}, $page_id, \%tmplflds);
+	$self->store_properties($dbh, $sites->{$site}{id}, $page_id, \%tmplflds);
 
 	# Identify Images
 	if ($text && $opts{getimages}) {
 		my $nocomments = $text;
 		$nocomments =~ s/<!--.*?-->//g;
 		my @images = ($nocomments =~ /\[\[((?:Image|File):[^\#\|\]]+)/gi);
-		map { s/[^[:ascii:]]+//g; s/<!--.*?-->//g; process_page($site, $_, $page_id, $page); } @images;
+		map { s/[^[:ascii:]]+//g; s/<!--.*?-->//g; $self->process_page($site, $_, $page_id, $page); } @images;
 	}
 
 	# If we are getting a Image: page, then go get the corresponding image file
-	get_image($page) if ($isimage && $page_id && !exists $meta{missing} && ($site ne 'ES'));
+	$self->get_image($page) if ($isimage && $page_id && !exists $meta{missing} && ($site ne 'ES'));
 
 	# Add redirects
 	print "\tCreating Redirect Pages\n";
-	my @redirs = get_redirects($page,$site,1);
+	my @redirs = $self->get_redirects($page,$site,1);
 	push @redirs, $orig_page_name if defined $orig_page_name;
-	map { create_redirect_text($page, $site, $_) } @redirs;
+	map { $self->create_redirect_text($dbh, $page, $site, $_) } @redirs;
 }
 
 sub rescan_page
 {
+	my $self = shift;
+
 	my $site = shift;
 	my $page = shift;
 	my $parent_page_id = shift;
@@ -363,6 +399,7 @@ sub rescan_page
 
 	my $isimage = ($page =~ /^(?:Image|File):/i) ? 1 : 0;
 
+	my $dbh = $self->{DBH};
 	my ($text, $page_id) = $dbh->selectrow_array(
 	 "select c.text, a.id
 		from pages a
@@ -389,16 +426,19 @@ sub rescan_page
 	$text = decode_utf8($text);
 
 	if ($site ne 'ES') {
-		for my $module (@modules) {
+		for my $module (@{$self->{MODULES}}) {
 			$text = $module->process_text($dbh, $page, $site, $text, $page_id);
 		}
 
-		store_revision($dbh, $sites->{$site}{id}, $page_id, 'ESMERGE', $text, \%meta);
+		$self->store_revision($dbh, $sites->{$site}{id}, $page_id, 'ESMERGE', $text, \%meta);
 	}
 }
 
 sub get_contributors
 {
+	my $self = shift;
+
+	my $dbh = shift;
 	my $site = shift;
 	my $page = shift;
 	my $page_id = shift;
@@ -413,7 +453,7 @@ sub get_contributors
 	print "\tExporting Contributors from " . $sites->{$site}{desc} . "...\n";
 
 	if ($site eq 'ES') {
-		$text = get_page($site, $contrib_page, \%meta);
+		$text = $self->get_page($site, $contrib_page, \%meta);
 		return if (exists $meta{missing} || exists $meta{uptodate});
 	}
 	else {
@@ -421,11 +461,11 @@ sub get_contributors
 
 		my $url = "http://" . $sites->{$site}{url} . "/api.php";
 		my $q = "action=query&prop=revisions&titles=$page&rvlimit=max&rvprop=user&format=xml";
-		my $xml = do_query($url, $q);
-		my $revstartid = parse_rev_xml($xml, \%contribs);
+		my $xml = $self->do_query($url, $q);
+		my $revstartid = $self->parse_rev_xml($xml, \%contribs);
 		while($revstartid != 0) {
-			$xml = do_query($url, $q . '&rvstartid=' . $revstartid);
-			$revstartid = parse_rev_xml($xml, \%contribs);
+			$xml = $self->do_query($url, $q . '&rvstartid=' . $revstartid);
+			$revstartid = $self->parse_rev_xml($xml, \%contribs);
 		}
 
 		my $linkpage = $page;
@@ -444,13 +484,15 @@ EOF
 	}
 
 	print "Storing $contrib_page\n";
-	my ($contrib_page_id, $last_revid) = page_in_cache($site, $contrib_page);
+	my ($contrib_page_id, $last_revid) = $self->page_in_cache($site, $contrib_page);
 	$meta{existing_page_id} = $contrib_page_id;
-	store_page($dbh, $site, $contrib_page, $text, undef, $page_id, $page, \%meta);
+	$self->store_page($dbh, $site, $contrib_page, $text, undef, $page_id, $page, \%meta);
 }
 
 sub parse_export_xml
 {
+	my $self = shift;
+
 	my $xml = shift;
 	my $meta = shift; # Must be a reference;
 
@@ -496,6 +538,8 @@ sub parse_export_xml
 
 sub parse_rev_xml
 {
+	my $self = shift;
+
 	my $xml = shift;
 	my $contribref = shift;
 
@@ -523,6 +567,8 @@ sub parse_rev_xml
 
 sub get_page
 {
+	my $self = shift;
+
 	my $site = shift;
 	my $page = shift;
 	my $meta = shift;
@@ -534,16 +580,16 @@ sub get_page
 	$page = uri_escape_utf8($page);
 
 	my $q = "action=query&prop=revisions&titles=$page&rvlimit=1&rvprop=ids|timestamp&redirects=1&format=xml";
-	my $xml =  do_query($url, $q);
-	my $text = parse_export_xml($xml, $meta);
+	my $xml =  $self->do_query($url, $q);
+	my $text = $self->parse_export_xml($xml, $meta);
 
 	if (defined $meta && (exists $meta->{missing}) && (defined $sites->{$site}{alt_url})) {
 		$url = $alturl;
 		$page = $meta->{realpage} if exists $meta->{realpage};
 		$page = uri_escape_utf8($page);
 		$q = "action=query&prop=revisions&titles=$page&rvlimit=1&rvprop=ids|timestamp&redirects=1&format=xml";
-		$xml = do_query($url, $q);
-		$text = parse_export_xml($xml, $meta);
+		$xml = $self->do_query($url, $q);
+		$text = $self->parse_export_xml($xml, $meta);
 	}
 
 	my $cachedpage = (exists $meta->{cachedpage}) ? $meta->{cachedpage} : $meta->{realpage};
@@ -552,7 +598,7 @@ sub get_page
 	$cachedpage =~ s/^File:/Image:/;
 	
 	# Check to see if the page already exists, if it does has it been updated?
-	my ($page_id, $last_revid) = page_in_cache($site, $cachedpage);
+	my ($page_id, $last_revid) = $self->page_in_cache($site, $cachedpage);
 
 	if (defined $meta && defined $page_id) {
 		$meta->{existing_page_id} = $page_id;
@@ -568,13 +614,15 @@ sub get_page
 	# Page does not exist or is out of date, so go get the text
 	print "\tPage out-of-date ... retrieving content\n" if defined $meta && exists $meta->{existing_page_id};
 	my $q = "action=query&prop=revisions&titles=$page&rvlimit=1&rvprop=ids|timestamp|content&redirects=1&format=xml";
-	my $xml =  do_query($url, $q);
-	my $text = parse_export_xml($xml, $meta);
+	my $xml =  $self->do_query($url, $q);
+	my $text = $self->parse_export_xml($xml, $meta);
 	return $text;
 }
 
 sub do_query
 {
+	my $self = shift;
+
 	my $url = shift;
 	my $q = shift;
 
@@ -582,6 +630,7 @@ sub do_query
 	$req->content_type('application/x-www-form-urlencoded');
 	$req->content($q);
 
+	my $ua = $self->{UA};
 	my $res = $ua->request($req);
 
 	# Check the outcome of the response
@@ -598,6 +647,8 @@ sub do_query
 
 sub get_template
 {
+	my $self = shift;
+
 	my $text = shift;
 	my $want_infobox = shift;
 
@@ -611,12 +662,14 @@ sub get_template
 		$ib = extract_bracketed($text, '{}');
 	}
 
-	get_template_fields($ib);
+	$self->get_template_fields($ib);
 	return($text, $ib);
 }
 
 sub get_template_fields
 {
+	my $self = shift;
+
 	my $text = shift;
 
 	$text =~ s/^\{\{\s*(.*)\}\}\s*$/\1/ism;
@@ -657,6 +710,8 @@ sub get_template_fields
 
 sub create_release_template
 {
+	my $self = shift;
+
 	my $site = shift;
 	my $title = shift;
 	my $type = shift;
@@ -696,6 +751,9 @@ EOF
 
 sub create_redirect_text
 {
+	my $self = shift;
+
+	my $dbh = shift;
 	my $page = shift;
 	my $site = shift;
 	my $redir = shift;
@@ -724,6 +782,8 @@ sub create_redirect_text
 
 sub get_image
 {
+	my $self = shift;
+
 	my $page = shift;
 
 	my $wppath;
@@ -763,6 +823,7 @@ sub get_image
 	my $req = HTTP::Request->new(GET => $url);
 
 	print "Retrieving Image File: $url to '$espath'\n";
+	my $ua = $self->{UA};
 	my $res = $ua->request($req, "$espath");
 
 	if (!$res->is_success) {
@@ -795,6 +856,8 @@ sub get_image
 
 sub get_redirects
 {
+	my $self = shift;
+
 	my $page = shift;
 	my $site = shift;
 	my $verbose = shift;
@@ -810,14 +873,14 @@ sub get_redirects
 
 	my $url = ($site eq 'WP') ? $wpapi : $esapi;
 	my $q = "action=query&list=backlinks&bltitle=$page&bllimit=max&blfilterredir=redirects&format=xml";
-	my $xml = do_query($url, $q);
+	my $xml = $self->do_query($url, $q);
 
 	my ($cont, @redirs);
 	do {
-		($cont, @redirs) = parse_redir_xml($xml, $verbose);
+		($cont, @redirs) = $self->parse_redir_xml($xml, $verbose);
 		map { chomp;  s/^\s*//; s/\s*$//; push @redirects, $_ } @redirs;
 
-		$xml = do_query($wpapi, $q . '&blcontinue=' . $cont) if $cont;
+		$xml = $self->do_query($wpapi, $q . '&blcontinue=' . $cont) if $cont;
 	} while ($cont);
 
 	return @redirects;
@@ -825,6 +888,8 @@ sub get_redirects
 
 sub parse_redir_xml
 {
+	my $self = shift;
+
 	my $xml = shift;
 	my $verbose = shift;
 
@@ -852,8 +917,11 @@ sub parse_redir_xml
 
 sub allpages
 {
+	my $self = shift;
+
 	my @allpages;
 
+	my $esobj = $self->{ESOBJ};
 	$esobj->list( { action => 'query',
 									list => 'allpages',
 									aplimit => 'max',
@@ -867,10 +935,14 @@ sub allpages
 
 sub page_in_cache
 {
+	my $self = shift;
+
 	my $site = shift;
 	my $title = shift;
 
 	my $site_id = $sites->{$site}{id};
+
+	my $dbh = $self->{DBH};
 
 	my $page_id = 0;
 	my $last_revid = 0;
@@ -911,6 +983,9 @@ sub page_in_cache
 
 sub delete_page_id
 {
+	my $self = shift;
+
+	my $dbh = shift;
 	my $page_id = shift;
 
 	$dbh->do("delete from pages where id = $page_id");
@@ -926,6 +1001,8 @@ sub delete_page_id
 
 sub store_page
 {
+	my $self = shift;
+
 	my $dbh = shift;
 	my $site = shift;
 	my $title = shift;
@@ -987,7 +1064,7 @@ sub store_page
 		$page_id = $dbh->last_insert_id(undef, undef, undef, undef);
 	}
 
-	my $revision_id = store_revision($dbh, $site_id, $page_id, 'ORIG', $text, $meta);
+	my $revision_id = $self->store_revision($dbh, $site_id, $page_id, 'ORIG', $text, $meta);
 
 	# TODO: Need to decide what should happen if a category link used to exist, then was subsequently removed.
 	# Should it be deleted here?
@@ -1027,6 +1104,8 @@ sub store_page
 
 sub store_revision
 {
+	my $self = shift;
+
 	my $dbh = shift;
 	my $site_id = shift;
 	my $page_id = shift;
@@ -1115,6 +1194,8 @@ sub store_revision
 
 sub export_pages
 {
+	my $self = shift;
+
 	my $opts = shift;
 
 	my $site = $opts->{site};
@@ -1125,6 +1206,8 @@ sub export_pages
 	my $level = shift || 0;
 
 	unlink $sites->{$site}{file} if !$parent && !$append;
+
+	my $dbh = $self->{DBH};
 
 	my $updsql = ($updated) ? "and a.updated = 1" : "";
 	my $parsql = ($parent) ?
@@ -1167,18 +1250,22 @@ sub export_pages
 		close FH;
 
 		$opts->{parent} = $page_id;
-		export_pages($opts, $level+1);
+		$self->export_pages($opts, $level+1);
 
-		export_redirects($site, $title, $page_id, $level);
+		$self->export_redirects($site, $title, $page_id, $level);
 	}
 }
 
 sub update_pages
 {
+	my $self = shift;
+
 	my $site = shift;
 
 	my $startcond = "";
 	$startcond = "and a.title >= '$opts{start}'" if defined $opts{start};
+
+	my $dbh = $self->{DBH};
 
 	my $sth = $dbh->prepare(
 	 "select a.title
@@ -1197,17 +1284,21 @@ sub update_pages
 	while (($title) = $sth->fetchrow_array) {
 		$title = decode_utf8($title);
 		if ($opts{rescan}) {
-			rescan_page($site, $title);
+			$wpexp->rescan_page($site, $title);
 		}
 		else {
-			process_page($site, $title);
+			$wpexp->process_page($site, $title);
 		}
 	}
 }
 
 sub existing_page_text
 {
+	my $self = shift;
+
 	my $page_id = shift;
+
+	my $dbh = $self->{DBH};
 
 	my ($text) = $dbh->selectrow_array(
 	 "select c.text
@@ -1225,6 +1316,10 @@ sub existing_page_text
 
 sub print_status
 {
+	my $self = shift;
+
+	my $dbh = $self->{DBH};
+
 	my $status = $dbh->selectall_arrayref(
 	 "select s.name, count(*)
 		from pages p
@@ -1240,8 +1335,12 @@ sub print_status
 
 sub delete_page
 {
+	my $self = shift;
+
 	my $site = shift;
 	my $title = shift;
+
+	my $dbh = $self->{DBH};
 
 	my $site_id;
 	my $page_id;
@@ -1276,19 +1375,23 @@ sub delete_page
 	$sth->execute;
 
 	while (my ($title) = $sth->fetchrow_array) {
-		delete_page($site, $title);
+		$self->delete_page($site, $title);
 	}
 
-	delete_page_id($page_id);
+	$self->delete_page_id($dbh, $page_id);
 
 	print "\tPage DELETED!\n";
 }
 
 sub relink_images
 {
+	my $self = shift;
+
 	my $site = shift;
 
 	my $site_id = $sites->{$site}{id};
+
+	my $dbh = $self->{DBH};
 
 	my $sth = $dbh->prepare(
 	 "select a.id, a.title
@@ -1302,7 +1405,7 @@ sub relink_images
 
 	my ($page_id, $title);
 	while (($page_id, $title) = $sth->fetchrow_array) {
-		my $text = existing_page_text($page_id);
+		my $text = $self->existing_page_text($page_id);
 
 		print "Relinking Images in $title\n";
 
@@ -1346,6 +1449,8 @@ sub relink_images
 
 sub import_pages
 {
+	my $self = shift;
+
 	my $site = shift;
 	
 	my $file = $sites->{$site}{file};
@@ -1387,12 +1492,16 @@ sub import_pages
 
 sub export_redirects
 {
+	my $self = shift;
+
 	my $site = shift;
 	my $title = shift;
 	my $page_id = shift;
 	my $level = shift;
 
 	open FH, ">>:utf8", $sites->{$site}{file};
+
+	my $dbh = $site->{DBH};
 
 	my $sth = $dbh->prepare(
 	 "select title
@@ -1418,9 +1527,13 @@ sub export_redirects
 
 sub merge_changes
 {
+	my $self = shift;
+
 	my $sitepair = shift;
 
 	my ($from, $to) = split(/:/, uc $sitepair);
+
+	my $dbh = $self->{DBH};
 
 	$dbh->do(
 	 "create temporary table tmp_wpcontrib_links
@@ -1457,13 +1570,15 @@ sub merge_changes
 	);
 
 	print "Exporting $from...\n";
-	export_pages({site => $from, updated => 0});
+	$self->export_pages({site => $from, updated => 0});
 	print "Exporting $to...\n";
-	export_pages({site => $to, updated => 0});
+	$self->export_pages({site => $to, updated => 0});
 }
 
 sub store_properties
 {
+	my $self = shift;
+
 	my $dbh = shift;
 	my $site_id = shift;
 	my $page_id = shift;
@@ -1480,18 +1595,20 @@ sub store_properties
 	);
 
 	if (!defined $section_id) {
-		$section_id = store_property($dbh, $site_id, $page_id, undef, 1, $section, undef);
+		$section_id = $self->store_property($dbh, $site_id, $page_id, undef, 1, $section, undef);
 	}
 
 	# TODO: Need to decide what should happen if a template field used to exist, then was subsequently removed.
 	# Should it be deleted here?
 	while (my ($key,$val) = each %$tmplflds) {
-		store_property($dbh, $site_id, $page_id, $section_id, 2, $key, $val);
+		$self->store_property($dbh, $site_id, $page_id, $section_id, 2, $key, $val);
 	}
 }
 
 sub store_property
 {
+	my $self = shift;
+
 	my $dbh = shift;
 	my $site_id = shift;
 	my $page_id = shift;
@@ -1526,4 +1643,12 @@ sub store_property
 	);
 
 	return $dbh->last_insert_id(undef, undef, undef, undef);
+}
+
+sub clear_updated_flags
+{
+	my $self = shift;
+
+	my $dbh = $self->{DBH};
+	$dbh->do("update pages set updated = 0");
 }
