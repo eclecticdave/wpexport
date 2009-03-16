@@ -1,4 +1,4 @@
-#! /usr/bin/perl
+# ! /usr/bin/perl
 
 #
 # Script to get wikipedia pages and prepare them for merging with encoresoup.
@@ -214,9 +214,9 @@ sub new
 	$self->{UA} = $ua;
 
 	# Cache valid page titles into 'keeplinks' hashref
-	#my $keeplinks = $dbh->selectall_arrayref("select distinct title from titles");
-	#my %keeplinks = map { lc $_->[0] => 1 } (@$keeplinks);
-	#$self->{KEEPLINKS} = \%keeplinks;
+	my $keeplinks = $dbh->selectall_arrayref("select distinct title from titles");
+	my %keeplinks = map { lc $_->[0] => 1 } (@$keeplinks);
+	$self->{KEEPLINKS} = \%keeplinks;
 
 	bless ($self, $class);
 	return $self;
@@ -235,17 +235,11 @@ sub load_modules
 		for my $modulename (@modulenames) {
 			next if !$modulename || $modulename =~ /^#/;
 			require "modules/$modulename.pm";
-			push @modules, $modulename->new($wpexp->dbh());
+			push @modules, $modulename->new($wpexp);
 		}
 	}
 
 	$self->{MODULES} = \@modules;
-}
-
-sub dbh
-{
-	my $self = shift;
-	return $self->{DBH};
 }
 
 sub process_page
@@ -288,18 +282,18 @@ sub process_page
 		$page = $meta{realpage};
 	}
 
-	my $page_id = $self->store_page($dbh, $site, $page, $text, \%tmplflds, $parent_page_id, $parent_page, \%meta);
+	my $page_id = $self->store_page($site, $page, $text, $parent_page_id, $parent_page, \%meta);
 
 	# page_id will be zero if page already exists and does not need updating.
 	if ($page_id && ($site ne 'ES')) {
 		for my $module (@{$self->{MODULES}}) {
-			$text = $module->process_text($dbh, $page, $site, $text, $page_id);
+			$text = $module->process_text($page, $site, $text, $page_id);
 		}
 
 		$self->store_revision($dbh, $sites->{$site}{id}, $page_id, 'ESMERGE', $text, \%meta);
 
 		# Do Wikipedia Revision Info Export
-		$self->get_contributors($dbh, $site, $page, $page_id) unless $opts{nocontrib};
+		$self->get_contributors($site, $page, $page_id) unless $opts{nocontrib};
 	}
 	else {
 		# Get the existing page for child pages to link to.
@@ -315,14 +309,13 @@ sub process_page
 		print "\tNEED TO GET VERSION TEMPLATE!!\n\n" unless $site eq 'ES';
 
 		for my $tmpl ('Latest stable release','Latest preview release') {
-			undef %tmplflds;
 			undef %meta;
 			my $tmpl_page = $meta{cachedpage} = "Template:$tmpl/$page";
 			my $text = $self->get_page($site, "$tmpl_page", \%meta);
 			if (!exists $meta{missing} && !exists $meta{uptodate}) {
 				$self->get_template($text,0);
 
-				my $tmpl_page_id = $self->store_page($dbh, $site, $tmpl_page, $text, \%tmplflds, $page_id, $page, \%meta);
+				my $tmpl_page_id = $self->store_page($site, $tmpl_page, $text, $page_id, $page, \%meta);
 
 				if ($tmplflds{template} ne 'Release') {
 					my $latest_release_version = $tmplflds{latest_release_version};
@@ -347,12 +340,12 @@ sub process_page
 			if ($latest_release_version) {
 				my $text = $self->create_release_template($site, $page, 'Latest stable release', $latest_release_version, $latest_release_date, $page_id);
 				my ($tmpl_page_id, $last_revid) = $self->page_in_cache($site, "Template:Latest stable release/$page");
-				$self->store_page($dbh, $site, "Template:Latest stable release/$page", $text, undef, $page_id, $page, { existing_page_id => $tmpl_page_id });
+				$self->store_page($site, "Template:Latest stable release/$page", $text, $page_id, $page, { existing_page_id => $tmpl_page_id });
 			}
 			if ($latest_preview_version) {
 				my $text = $self->create_release_template($site, $page, 'Latest preview release', $latest_preview_version, $latest_preview_date, $page_id);
 				my ($tmpl_page_id, $last_revid) = $self->page_in_cache($site, "Template:Latest preview release/$page");
-				$self->store_page($dbh, $site, "Template:Latest preview release/$page", $text, undef, $page_id, $page, { existing_page_id => $tmpl_page_id });
+				$self->store_page($site, "Template:Latest preview release/$page", $text, $page_id, $page, { existing_page_id => $tmpl_page_id });
 			}
 		}
 	}
@@ -374,7 +367,7 @@ sub process_page
 	print "\tCreating Redirect Pages\n";
 	my @redirs = $self->get_redirects($page,$site,1);
 	push @redirs, $orig_page_name if defined $orig_page_name;
-	map { $self->create_redirect_text($dbh, $page, $site, $_) } @redirs;
+	map { $self->create_redirect_text($page, $site, $_) } @redirs;
 }
 
 sub rescan_page
@@ -427,7 +420,7 @@ sub rescan_page
 
 	if ($site ne 'ES') {
 		for my $module (@{$self->{MODULES}}) {
-			$text = $module->process_text($dbh, $page, $site, $text, $page_id);
+			$text = $module->process_text($page, $site, $text, $page_id);
 		}
 
 		$self->store_revision($dbh, $sites->{$site}{id}, $page_id, 'ESMERGE', $text, \%meta);
@@ -438,10 +431,11 @@ sub get_contributors
 {
 	my $self = shift;
 
-	my $dbh = shift;
 	my $site = shift;
 	my $page = shift;
 	my $page_id = shift;
+
+	my $dbh = $self->{DBH};
 
 	my $contrib_page = $page;
 	#$contrib_page =~ s/:/ /g;
@@ -486,7 +480,7 @@ EOF
 	print "Storing $contrib_page\n";
 	my ($contrib_page_id, $last_revid) = $self->page_in_cache($site, $contrib_page);
 	$meta{existing_page_id} = $contrib_page_id;
-	$self->store_page($dbh, $site, $contrib_page, $text, undef, $page_id, $page, \%meta);
+	$self->store_page($site, $contrib_page, $text, $page_id, $page, \%meta);
 }
 
 sub parse_export_xml
@@ -753,10 +747,11 @@ sub create_redirect_text
 {
 	my $self = shift;
 
-	my $dbh = shift;
 	my $page = shift;
 	my $site = shift;
 	my $redir = shift;
+
+	my $dbh = $self->{DBH};
 
 	$page = $dbh->quote($page);
 	$redir = $dbh->quote($redir);
@@ -985,8 +980,9 @@ sub delete_page_id
 {
 	my $self = shift;
 
-	my $dbh = shift;
 	my $page_id = shift;
+
+	my $dbh = $self->{DBH};
 
 	$dbh->do("delete from pages where id = $page_id");
 	$dbh->do("delete from revisions where page_id = $page_id");
@@ -1003,14 +999,14 @@ sub store_page
 {
 	my $self = shift;
 
-	my $dbh = shift;
 	my $site = shift;
 	my $title = shift;
 	my $text = shift;
-	my $tmplflds = shift;
 	my $parent_page_id = shift;
 	my $parent_page = shift;
 	my $meta = shift;
+
+	my $dbh = $self->{DBH};
 
 	my $revision_id;
 	my $text_id;
@@ -1378,7 +1374,7 @@ sub delete_page
 		$self->delete_page($site, $title);
 	}
 
-	$self->delete_page_id($dbh, $page_id);
+	$self->delete_page_id($page_id);
 
 	print "\tPage DELETED!\n";
 }
@@ -1478,7 +1474,7 @@ sub import_pages
 		if ($_ eq '{{-stop-}}') {
 			print "TITLE: $title\n\n";
 			#Needs some work
-			#store_page($dbh, $site, $title, $text, undef, undef, undef);
+			#store_page($site, $title, $text, undef, undef, undef);
 
 			$title = $text = "";
 			next;
@@ -1651,4 +1647,98 @@ sub clear_updated_flags
 
 	my $dbh = $self->{DBH};
 	$dbh->do("update pages set updated = 0");
+}
+
+sub create_page_link
+{
+	my $self = shift;
+
+	my $site = shift;
+	my $page_id = shift;
+	my $to_site = shift;
+
+	my $dbh = $self->{DBH};
+	my $site_id = $self->{SITES}{$site}{id};
+	my $es_site_id = $self->{SITES}{$to_site}{id};
+
+	my $link_page_id = 0;
+
+	($link_page_id) = $dbh->selectrow_array(
+	 "select a.page_id
+	  from titles a
+		  inner join pages b
+				on a.title = b.title
+		where b.id = $page_id
+		and a.site_id = $es_site_id"
+	);
+
+	return unless $link_page_id;
+
+	# First check if there is already a link!
+	my ($count) = $dbh->selectrow_array(
+	 "select count(*)
+	  from pagelinks
+		where page_id_parent = $page_id
+		and page_id_child = $link_page_id"
+	);
+
+	return $link_page_id if $count;
+
+	# Link the pages together
+	$dbh->do(
+	 "insert into pagelinks
+	  (
+			site_id_parent,
+		  page_id_parent,
+			site_id_child,
+			page_id_child
+		)
+		values
+		(
+			$site_id,
+			$page_id,
+			$es_site_id,
+			$link_page_id
+		)"
+	);
+
+	return $link_page_id;
+}
+
+sub get_categories
+{
+	my $self = shift;
+
+	my $page_id = shift;
+	my $site = shift;
+
+	my $dbh = $self->{DBH};
+	my $site_id = $self->{SITES}{$site}{id};
+
+	my $catsref = $dbh->selectall_arrayref(
+	 "select name
+		from categories
+		where page_id = $page_id
+		and site_id = $site_id"
+	);
+
+	return $catsref;
+}
+
+sub process_link
+{
+	my $self = shift;
+
+	my $link = shift;
+	my $desc = shift;
+
+	$link =~ s/^\s*//;
+	$link =~ s/\s*$//;
+
+	if ($self->{KEEPLINKS}{lc $link}) {
+		return (defined $desc) ? "[[$link|$desc]]" : "[[$link]]";
+	}
+	else {
+		return (defined $desc) ? $desc : $link;
+	}
 }

@@ -26,17 +26,11 @@ package encoresoup;
 sub new
 {
 	my $class = shift;
-	my $dbh = shift;
+	my $wpexp = shift;
 
 	my $self = {};
 
-	# Cache 'sites' table into hashref
-	$self->{SITES} = $dbh->selectall_hashref("select * from sites", 'name');
-
-	# Cache valid page titles into 'keeplinks' hashref
-	my $keeplinks = $dbh->selectall_arrayref("select distinct title from titles");
-	my %keeplinks = map { lc $_->[0] => 1 } (@$keeplinks);
-	$self->{KEEPLINKS} = \%keeplinks;
+	$self->{WPEXP} = $wpexp;
 
 	bless ($self, $class);
 	return $self;
@@ -46,17 +40,16 @@ sub process_text
 {
 	my $self = shift;
 
-	my $dbh = shift;
 	my $title = shift;
 	my $site = shift;
   my $text = shift;
   my $page_id = shift;
 
-	# Try to locate equivalent page on Encoresoup
-	my $link_page_id = $self->_link_matching_page($dbh, $site, $title, $page_id);
-	print "\tPage Linked to $title (id = $page_id) is id $link_page_id\n";
+	my $wpexp = $self->{WPEXP};
 
-	my $es_site_id = $self->{SITES}{ES}{id};
+	# Try to locate equivalent page on Encoresoup
+	my $link_page_id = $wpexp->create_page_link($site, $page_id, 'ES');
+	print "\tPage Linked to $title (id = $page_id) is id $link_page_id\n";
 
 	my $isimage = ($title =~ /^(?:Image|File):/i) ? 1 : 0;
 
@@ -77,8 +70,8 @@ sub process_text
 		# Processing Wikipedia Extract ...
 
 		# Unlink Wiki-links
-		$text =~ s/\[\[([^\]:]*?)\|(.*?)\]\]/$self->_process_link($1,$2)/ge;
-		$text =~ s/\[\[([^\]\|:]*?)\]\]/$self->_process_link($1)/ge;
+		$text =~ s/\[\[([^\]:]*?)\|(.*?)\]\]/$wpexp->process_link($1,$2)/ge;
+		$text =~ s/\[\[([^\]\|:]*?)\]\]/$wpexp->process_link($1)/ge;
 
 		# Add Wikipedia-Attrib template for comparison purposes.
 		$text = "{{Wikipedia-Attrib|$title}}\n" . $text;
@@ -95,12 +88,7 @@ sub process_text
 
 		if (defined $link_page_id) {
 			print "\tGetting Encoresoup Categories (page_id = $link_page_id)\n";
-			my $catsref = $dbh->selectall_arrayref(
-			 "select name
-				from categories
-				where page_id = $link_page_id
-				and site_id = $es_site_id"
-			);
+			my $catsref = $wpexp->get_categories($link_page_id, 'ES');
 
 			my @cats = map { '[[Category:' . $_->[0] . ']]' } @$catsref;
 			my $catstr = join("\n", @cats);
@@ -144,94 +132,6 @@ sub process_text
 	}
 
 	return $text;
-}
-
-sub _process_link
-{
-	my $self = shift;
-
-	my $link = shift;
-	my $desc = shift;
-
-	$link =~ s/^\s*//;
-	$link =~ s/\s*$//;
-
-	if ($self->{KEEPLINKS}{lc $link}) {
-		return (defined $desc) ? "[[$link|$desc]]" : "[[$link]]";
-	}
-	else {
-		return (defined $desc) ? $desc : $link;
-	}
-}
-
-sub _link_matching_page
-{
-	my $self = shift;
-
-	my $dbh = shift;
-	my $site = shift;
-	my $page = shift;
-	my $page_id = shift;
-
-	my $site_id = $self->{SITES}{$site}{id};
-	my $es_site_id = $self->{SITES}{ES}{id};
-
-	my $link_page_id = 0;
-
-	($link_page_id) = $dbh->selectrow_array(
-	 "select id
-	  from pages
-		where title = ?
-		and site_id = $es_site_id",
-
-		undef,
-		$page
-	);
-
-	if (!$link_page_id) {
-		# There might be a redirect with the matching title
-		($link_page_id) = $dbh->selectrow_array(
-		 "select page_id
-			from redirects
-			where title = ?
-			and site_id = $es_site_id",
-
-			undef,
-			$page
-		);
-	}
-
-	return unless $link_page_id;
-
-	# First check if there is already a link!
-	my ($count) = $dbh->selectrow_array(
-	 "select count(*)
-	  from pagelinks
-		where page_id_parent = $page_id
-		and page_id_child = $link_page_id"
-	);
-
-	return $link_page_id if $count;
-
-	# Link the pages together
-	$dbh->do(
-	 "insert into pagelinks
-	  (
-			site_id_parent,
-		  page_id_parent,
-			site_id_child,
-			page_id_child
-		)
-		values
-		(
-			$site_id,
-			$page_id,
-			$es_site_id,
-			$link_page_id
-		)"
-	);
-
-	return $link_page_id;
 }
 
 1;
