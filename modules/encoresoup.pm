@@ -23,6 +23,9 @@
 
 package encoresoup;
 
+use Text::Balanced qw ( extract_bracketed );
+use Date::Manip;
+
 sub new
 {
 	my $class = shift;
@@ -36,7 +39,26 @@ sub new
 	return $self;
 }
 
-sub process_text
+sub process_page
+{
+	my $self = shift;
+
+	my $title = shift;
+	my $site = shift;
+  my $text = shift;
+  my $page_id = shift;
+	my $properties = shift;
+
+	# We are only interested in pages from Wikipedia, not our own pages!
+	return undef if $site eq 'ES';
+
+	$text = $self->_process_text($title, $site, $text, $page_id);
+
+	$self->_get_infobox_info($text,$properties);
+	return $text;
+}
+
+sub _process_text
 {
 	my $self = shift;
 
@@ -130,6 +152,234 @@ sub process_text
 		#my $ib = extract_bracketed($text, '{}', quotemeta $prefix);
 		#$text = $ib . $text;
 	}
+
+	return $text;
+}
+
+sub _get_infobox_info
+{
+	my $self = shift;
+
+	my $text = shift;
+	my $properties = shift;
+
+	$self->_get_template($text,1,$properties);
+}
+
+sub _get_template
+{
+	my $self = shift;
+
+	my $text = shift;
+	my $want_infobox = shift;
+
+	my $properties = shift;
+
+	my $ib;
+	if ($want_infobox) {
+		my ($prefix) = $text =~ /^(.*)\{\{\s*infobox/ism;
+		return unless defined $prefix;
+		$ib = extract_bracketed($text, '{}', quotemeta $prefix);
+	}
+	else {
+		$ib = extract_bracketed($text, '{}');
+	}
+
+	my ($tname, $tmplflds) = $self->_get_template_fields($ib);
+
+	$tname = 'infobox' if $want_infobox;
+
+	$properties->{$tname} = $tmplflds;
+}
+
+sub _get_template_fields
+{
+	my $self = shift;
+
+	my $text = shift;
+
+	$text =~ s/^\{\{\s*(.*)\}\}\s*$/\1/ism;
+
+	# Remove HTML Comments
+  1 while $text =~ s/(.*)<!--.*?-->(.*)/\1\2/g;
+  # Remove <ref> sections
+  1 while $text =~ s/(.*)<ref.*?<\/ref>(.*)/\1\2/gi;
+  # Temporarily change delimiters inside wikilinks and templates
+  1 while $text =~ s/\[\[([^\]]*?)\|([^\]]*?)\]\]/\[\[\1¦\2\]\]/g;
+  1 while $text =~ s/\{\{([^\}]*?)\|([^\}]*?)\}\}/\{\{\1¦\2\}\}/g;
+
+	my @tmplflds = split(/\|/, $text);
+
+	my $tname = shift @tmplflds;
+	$tname =~ s/^\s*//;
+	$tname =~ s/\s*$//;
+	$tname =~ s/\s/_/g;
+
+	#$tmplflds{template} = $tname unless exists $tmplflds{template};
+	#print "Name: $tname\n\n";
+
+	for my $tmplfld (@tmplflds) {
+    # Put back wikilink delimiter
+    $tmplfld =~ s/¦/|/g;
+
+		my ($key, $val) = split(/=/, $tmplfld, 2);
+		map { s/^\s*//; s/\s*$//; } ($key, $val);
+		$key =~ s/\s/_/g;
+
+		$tmplflds{$key} = $val;
+		
+		#print "Key: '$key'\nVal: '$val'\n\n";
+	}
+
+	return ($tname, \%tmplflds);
+}
+
+# Create additional pages associated with main page from Wikipedia.
+sub additional_pages
+{
+	my $self = shift;
+
+	my $site = shift;
+	my $parent_page = shift;
+	my $parent_page_id = shift;
+	my $properties = shift;
+
+	$self->_create_contrib_page($site, $parent_page, $parent_page_id, $properties) unless $site eq 'ES';
+
+	if (($properties->{infobox}{frequently_updated} =~ /yes/i) || ($site eq 'ES'))
+	{
+		$self->_process_version_templates($site, $parent_page, $parent_page_id, $properties);
+	}
+
+	$self->_create_release_templates($site, $parent_page, $parent_page_id, $properties);
+}
+
+sub _create_contrib_page
+{
+	my $self = shift;
+
+	my $site = shift;
+	my $parent_page = shift;
+	my $parent_page_id = shift;
+	my $properties = shift;
+
+	my $wpexp = $self->{WPEXP};
+
+	my $contrib_page = "Template:WPContrib/$parent_page";
+
+	my $text;
+
+	return if ($site eq 'ES');
+
+	my $contribs = $wpexp->get_contributors($site, $parent_page);
+
+	my $linkpage = $parent_page;
+	$linkpage = ':' . $parent_page if $parent_page =~ /^(?:Image|File):/i;
+
+	$text = <<EOF
+== $parent_page - Wikipedia Contributors ==
+
+''The following people have contributed to the [[$linkpage]] article on Wikipedia, prior to it being imported into Encoresoup''
+<div class=\"references-small\" style=\"-moz-column-count:3; -webkit-column-count:3; column-count:3;\">
+EOF
+;
+
+	$text .= '*' . join("\n*", map { (/^[\d\.]*$/) ? "[[w:Special:Contributions/$_|$_]]" : "[[w:User:$_|$_]]" } sort(keys(%$contribs)));
+	$text .= "\n</div>\n";
+
+	print "Storing $contrib_page\n";
+	$wpexp->store_page($site, $contrib_page, $text, $parent_page_id, $parent_page);
+}
+
+sub _process_version_templates
+{
+	my $self = shift;
+
+	my $site = shift;
+	my $parent_page = shift;
+	my $parent_page_id = shift;
+	my $properties = shift;
+
+	my $wpexp = $self->{WPEXP};
+
+	for my $tmpl ('stable','preview') {
+		my %meta;
+		my %props;
+		my $tmpl_page = $meta{cachedpage} = "Template:Latest $tmpl release/$parent_page";
+		print "\tRetrieving $tmpl_page\n";
+		my $text = $wpexp->get_page($site, "$tmpl_page", \%meta);
+		if (!exists $meta{missing}) {
+			$self->_get_template($text,0,\%props);
+
+			my $latest_release_version = $props{latest_release_version} || $props{release_version};
+			my $latest_release_date = $props{latest_release_date} || $props{release_date};
+
+			$latest_release_version =~ s/\[http:[^\s]*\s([^\]]*)\]/\1/; # Remove download wikilink
+
+			$latest_release_date =~ s/\[\[([^\]]*)\]\]/\1/g; # Delink wikilinks
+			$latest_release_date =~ s/release date and age/release_date/;
+			$latest_release_date =~ s/release date/release_date/;
+			$latest_release_date =~ s/release_date\|(mf|df)=(.*?)\|/release_date\|/;
+
+			$properties->{infobox}{"latest_${tmpl}_version"} = $latest_release_version;
+			$properties->{infobox}{"latest_${tmpl}_date"} = $latest_release_date;
+		}
+	}
+}
+
+sub _create_release_templates
+{
+	my $self = shift;
+
+	my $site = shift;
+	my $parent_page = shift;
+	my $parent_page_id = shift;
+	my $properties = shift;
+
+	my $wpexp = $self->{WPEXP};
+
+	my $latest_release_version = $properties->{infobox}{latest_release_version};
+	my $latest_release_date = $properties->{infobox}{latest_release_date};
+	my $latest_preview_version = $properties->{infobox}{latest_preview_version};
+	my $latest_preview_date = $properties->{infobox}{latest_preview_date};
+
+	if ($latest_release_version) {
+		my $text = $self->_create_release_template($parent_page, 'Latest stable release', $latest_release_version, $latest_release_date);
+		$wpexp->store_page($site, "Template:Latest stable release/$page", $text, $parent_page_id, $parent_page);
+	}
+	if ($latest_preview_version) {
+		my $text = $self->_create_release_template($parent_page, 'Latest preview release', $latest_preview_version, $latest_preview_date);
+		$wpexp->store_page($site, "Template:Latest preview release/$page", $text, $parent_page_id, $parent_page);
+	}
+}
+
+sub _create_release_template
+{
+	my $self = shift;
+
+	my $title = shift;
+	my $type = shift;
+	my $version = shift;
+	my $date = shift;
+
+	$date = '{{release_date|' . UnixDate($date,"%Y|%m|%d") . '}}'
+			unless $date =~/^\{\{release/;
+
+	my $release_page = "Template:$type/$title";
+
+	my $text = <<EOF
+<!-- Please note: This template is auto-generated, so don't change anything except the version and date! -->
+{{Release|
+ article = $title
+|release_type=$type
+|release_version = $version
+|release_date = $date
+}}
+<noinclude>
+Back to article "'''[[$title]]'''"
+</noinclude>
+EOF
+;
 
 	return $text;
 }
